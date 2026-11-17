@@ -91,7 +91,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
                 connector=self.config.candles_connector,
                 trading_pair=self.config.candles_trading_pair,
                 interval=interval,
-                max_records=1000,
+                max_records=400,
             )
             for interval in intervals
         ]
@@ -105,7 +105,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
                     connector_name=self.config.candles_connector,
                     trading_pair=self.config.candles_trading_pair,
                     interval=interval,
-                    max_records=1000,
+                    max_records=400,
                 )
             except Exception as exc:
                 self.logger().warning(f"AIOT candles {interval} unavailable: {exc}")
