@@ -27,7 +27,7 @@ dependencies:
       # from this file is expected to record volume. utils/core_compatibility.py
       # refuses to start against a core that is missing them, so a wrong install is a
       # startup error rather than a deployment that books zeros in silence.
-      - hummingbot
+      - hummingbot @ git+https://github.com/ayj777/hummingbot.git@14ddd7290056f9e28b9463b75b2547ea6544c30a
       - geckoterminal-py>=0.3.1
       - msgpack>=1.0.5
       - flake8

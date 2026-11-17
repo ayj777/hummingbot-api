@@ -269,6 +269,13 @@ TICKER_SPECS: Dict[str, TickerSpec] = {
         symbol="symbol", bid="bidPrice", ask="askPrice", last="lastPrice",
         base_volume="volume", quote_volume="quoteVolume",
     ),
+    # MEXC futures: one call returns every contract. volume24 counts contracts, not base
+    # units, so only the USDT turnover (amount24) is used as volume.
+    "mexc_perpetual": TickerSpec(
+        path="/api/v1/contract/ticker", rows=_rows_at("data"),
+        symbol="symbol", bid="bid1", ask="ask1", last="lastPrice",
+        quote_volume="amount24",
+    ),
     "htx": TickerSpec(
         path="/market/tickers", rows=_rows_at("data"),
         symbol="symbol", bid="bid", ask="ask", last="close",

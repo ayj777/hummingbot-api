@@ -235,6 +235,7 @@ EXECUTOR_TYPES = Literal[
     "xemm_executor",
     "order_executor",
     "lp_executor",
+    "range_iceberg_executor",
 ]
 
 

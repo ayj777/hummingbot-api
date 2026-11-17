@@ -1,7 +1,7 @@
 services:
   hummingbot-api:
     container_name: hummingbot-api
-    image: hummingbot/hummingbot-api:latest
+    image: hummingbot-api:mexc-6e4f17e
     restart: unless-stopped
     ports:
       # SEC: loopback by default — this API holds exchange credentials and can move funds,

@@ -183,6 +183,12 @@ bots/archived/
 # directories one at a time is how bots/archived/ was missed while
 # bots/instances/ was covered.
 conf/
+# Controller YAMLs are strategy definitions, not credentials. Re-include only
+# that folder. Everything else under a conf/ directory stays ignored.
+!bots/conf/
+bots/conf/*
+!bots/conf/controllers/
+!bots/conf/controllers/*.yml
 
 # Local MCP configuration (project-specific overrides)
 .mcp.json
