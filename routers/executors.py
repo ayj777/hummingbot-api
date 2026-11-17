@@ -293,6 +293,11 @@ async def get_available_executor_types():
                 "type": "lp_executor",
                 "description": "LP position management for CLMM pools (Meteora, Raydium) ",
                 "use_case": "Automated liquidity provision with position tracking"
+            },
+            {
+                "type": "range_iceberg_executor",
+                "description": "Iceberg buying or selling inside a price range or up to a price cap, optionally spread over a time limit",
+                "use_case": "Accumulating or distributing size without showing it on the book"
             }
         ]
     }
