@@ -1,0 +1,15 @@
+id: aiot_rsi32
+controller_name: aiot_research
+controller_type: directional_trading
+connector_name: mexc_paper_trade
+trading_pair: AIOT-USDT
+candles_connector: mexc
+candles_trading_pair: AIOT-USDT
+total_amount_quote: 15000
+leverage: 1
+position_mode: ONEWAY
+strategy: rsi32
+stop_loss:
+take_profit:
+time_limit:
+trailing_stop:
