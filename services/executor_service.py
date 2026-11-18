@@ -42,6 +42,7 @@ from database import (
     ExecutorRepository,
     GatewayCLMMRepository,
     GatewaySwapRepository,
+    OrderRepository,
 )
 from models.executors import PositionHold
 from services.gateway_client import get_native_gas_token
@@ -50,6 +51,131 @@ from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
 logger = logging.getLogger(__name__)
+
+# Order rows that no longer need a cancel. DONE is the marker this service writes when a
+# child id drops out of the executor's working set between snapshots.
+_TERMINAL_ORDER_STATUSES = {
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "FAILED",
+    "COMPLETED",
+    "DONE",
+}
+_SKIP_ORDER_IDS = {"", "skipped"}
+_ORDER_LIST_KEYS = ("child_order_ids", "order_ids", "unknown_order_ids", "active_order_ids")
+_LEVEL_KEYS = ("levels", "orders")
+
+
+def _order_id_text(value: Any) -> Optional[str]:
+    """A client order id worth tracking, or None for blanks and placeholders."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text in _SKIP_ORDER_IDS:
+        return None
+    return text
+
+
+def _dict_order_id(item: Dict[str, Any]) -> Optional[str]:
+    return _order_id_text(item.get("order_id") or item.get("client_order_id"))
+
+
+def _is_filled_marker(item: Dict[str, Any]) -> bool:
+    return item.get("filled") is True or item.get("is_filled") is True
+
+
+def child_order_ids_from_custom_info(custom_info: Any) -> tuple[List[str], List[str]]:
+    """Split custom_info into working child order ids and filled ones.
+
+    Range iceberg reports ``child_order_ids`` plus per-level ``filled`` flags.
+    Position, DCA and TWAP report ``order_ids``. Order executor reports a single
+    ``order_id``. Filled ids and ``held_position_orders`` are the exposure to keep,
+    not orders to cancel.
+    """
+    if not isinstance(custom_info, dict):
+        return [], []
+
+    filled: List[str] = []
+    seen_filled: set = set()
+    working: List[str] = []
+    seen_working: set = set()
+
+    def mark_filled(value: Any) -> None:
+        oid = _order_id_text(value) if not isinstance(value, dict) else _dict_order_id(value)
+        if oid and oid not in seen_filled:
+            seen_filled.add(oid)
+            filled.append(oid)
+
+    def mark_working(value: Any) -> None:
+        oid = _order_id_text(value) if not isinstance(value, dict) else _dict_order_id(value)
+        if oid and oid not in seen_filled and oid not in seen_working:
+            seen_working.add(oid)
+            working.append(oid)
+
+    for item in custom_info.get("held_position_orders") or []:
+        mark_filled(item)
+
+    for key in _LEVEL_KEYS:
+        for item in custom_info.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            if _is_filled_marker(item):
+                mark_filled(item)
+            else:
+                mark_working(item)
+
+    for key in _ORDER_LIST_KEYS:
+        value = custom_info.get(key)
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, dict) and _is_filled_marker(item):
+                mark_filled(item)
+            else:
+                mark_working(item)
+
+    single = custom_info.get("order_id")
+    if isinstance(single, str):
+        mark_working(single)
+
+    working = [oid for oid in working if oid not in seen_filled]
+    return working, filled
+
+
+def _status_name(executor: Any) -> str:
+    status = getattr(executor, "status", None)
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name
+    return ""
+
+
+def _inflight_state_name(order: Any) -> str:
+    state = getattr(order, "current_state", None)
+    name = getattr(state, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _inflight_is_open(order: Any) -> bool:
+    """True when an in-flight order can still be working on the exchange."""
+    if order is None:
+        return False
+    if getattr(order, "is_failure", False):
+        return False
+    if getattr(order, "is_cancelled", False) or getattr(order, "is_canceled", False):
+        return False
+    state_name = _inflight_state_name(order)
+    if state_name in _TERMINAL_ORDER_STATUSES:
+        return False
+    if getattr(order, "is_filled", False) and getattr(order, "is_done", False):
+        return False
+    return True
+
+
+def _order_status_is_open(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    return status.upper() not in _TERMINAL_ORDER_STATUSES
 
 
 def _json_default(obj):
@@ -130,6 +256,13 @@ class ExecutorService:
     # a DELETE over two tables sharing the control loop's tick.
     PERFORMANCE_PRUNE_INTERVAL_SECONDS = 3600.0
 
+    # Graceful shutdown asks each executor to cancel working orders, then waits until the
+    # connector reports those cancels confirmed. The cap bounds stall time so a hung
+    # exchange cannot hold connector teardown open. MEXC perpetual exposes
+    # is_cancel_confirmed; connectors without that hook are not waited on.
+    SHUTDOWN_CANCEL_TIMEOUT_SECONDS = 30.0
+    SHUTDOWN_CANCEL_POLL_SECONDS = 0.25
+
     # Mapping of executor type strings to (executor_class, config_class)
     EXECUTOR_REGISTRY: Dict[str, tuple[Type[ExecutorBase], Type[ExecutorConfigBase]]] = {
         "position_executor": (PositionExecutor, PositionExecutorConfig),
@@ -204,6 +337,10 @@ class ExecutorService:
         # yet. Discovery runs on its own schedule, so retrying at the control loop's 1 Hz
         # would be a query a second against a row that appears about once a minute.
         self._lp_rent_retry_after: Dict[str, float] = {}
+
+        # Last child-order id set written for each live executor. The control loop
+        # compares against this and skips the database when nothing changed.
+        self._persisted_child_order_ids: Dict[str, tuple] = {}
 
         # Performance snapshot cadence, on the control loop's own clock (monotonic, so a
         # system clock step cannot stall the series or flood it).
@@ -280,6 +417,10 @@ class ExecutorService:
 
         Identifies executors marked as RUNNING in the database but not present
         in memory (i.e., from previous API sessions that were terminated).
+
+        Child orders those executors left open are cancelled from the persisted
+        order rows and custom_info before the rows are marked SYSTEM_CLEANUP.
+        Executors are not resumed.
         """
         if not self.db_manager:
             logger.debug("No database manager available, skipping orphaned executor cleanup")
@@ -288,6 +429,8 @@ class ExecutorService:
         try:
             # Get list of currently active executor IDs in memory
             active_executor_ids = list(self._active_executors.keys())
+
+            await self._cancel_orphaned_child_orders(active_executor_ids)
 
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
@@ -307,7 +450,13 @@ class ExecutorService:
             logger.error(f"Error cleaning up orphaned executors: {e}", exc_info=True)
 
     async def stop(self):
-        """Stop the executor service and all active executors."""
+        """Stop the executor service and all active executors.
+
+        Each executor still running is asked to early_stop with keep_position, which
+        cancels working orders and does not close a filled position. Shutdown then
+        waits, up to SHUTDOWN_CANCEL_TIMEOUT_SECONDS, until those cancels are
+        confirmed. Connector teardown happens only after this method returns.
+        """
         self._is_running = False
 
         if self._control_loop_task:
@@ -318,25 +467,398 @@ class ExecutorService:
                 pass
             self._control_loop_task = None
 
-        # Stop all active executors
+        # The API control loop is down, so it cannot persist a completion while a
+        # cancel is still unconfirmed. Each executor's own loop keeps running and
+        # is what observes the exchange ack.
         for executor_id in list(self._active_executors.keys()):
+            executor = self._active_executors.get(executor_id)
+            if executor is None or self._executor_is_closed(executor):
+                continue
+            await self._persist_running_child_orders(executor_id, executor)
+            if self._shutdown_already_started(executor):
+                # close_type was already chosen. Calling early_stop again would
+                # replace it and could skip a close that was in progress.
+                continue
             try:
-                executor = self._active_executors.get(executor_id)
-                if executor:
-                    executor.stop()
+                self._request_early_stop(executor)
             except Exception as e:
                 logger.error(f"Error stopping executor {executor_id}: {e}")
 
-        # Clear active executors
+        unconfirmed = await self._wait_for_cancel_confirmations(
+            list(self._active_executors.keys())
+        )
+
+        for executor_id in list(self._active_executors.keys()):
+            executor = self._active_executors.get(executor_id)
+            if executor is None:
+                continue
+            if executor_id in unconfirmed:
+                pending = [oid for oid in unconfirmed[executor_id] if oid]
+                if pending:
+                    logger.error(
+                        "Cancel was not confirmed for executor %s orders %s before connector "
+                        "shutdown. Leaving the executor RUNNING so startup can cancel them.",
+                        executor_id,
+                        ", ".join(pending),
+                    )
+                else:
+                    logger.error(
+                        "Executor %s did not finish cancelling working orders before connector "
+                        "shutdown. Leaving the executor RUNNING so startup can cancel them.",
+                        executor_id,
+                    )
+                self._stop_executor_task(executor_id, executor)
+                self._drop_executor_memory(executor_id)
+                continue
+            if not self._executor_is_closed(executor):
+                self._stop_executor_task(executor_id, executor)
+            await self._handle_executor_completion(executor_id)
+
+        # Clear anything completion did not claim.
         self._active_executors.clear()
         self._executor_metadata.clear()
 
-        # Cleanup trading interfaces
+        # Cleanup trading interfaces only after cancel confirmations (or the timeout).
         for trading_interface in self._trading_interfaces.values():
             await trading_interface.cleanup()
         self._trading_interfaces.clear()
 
         logger.info("ExecutorService stopped")
+
+    @staticmethod
+    def _executor_is_closed(executor: Any) -> bool:
+        if getattr(executor, "is_closed", False):
+            return True
+        return _status_name(executor) == "TERMINATED"
+
+    @staticmethod
+    def _shutdown_already_started(executor: Any) -> bool:
+        if getattr(executor, "_shutdown_pending", False):
+            return True
+        return _status_name(executor) == "SHUTTING_DOWN"
+
+    @staticmethod
+    def _request_early_stop(executor: Any) -> None:
+        """Cancel working orders and keep any fill. Do not unwind the position."""
+        try:
+            executor.early_stop(keep_position=True)
+        except TypeError as exc:
+            if "keep_position" not in str(exc):
+                raise
+            executor.early_stop()
+
+    def _stop_executor_task(self, executor_id: str, executor: Any) -> None:
+        try:
+            executor.stop()
+        except Exception as e:
+            logger.error(f"Error stopping executor task {executor_id}: {e}")
+
+    def _drop_executor_memory(self, executor_id: str) -> None:
+        """Forget an executor locally without writing a terminal database row."""
+        self._active_executors.pop(executor_id, None)
+        self._executor_metadata.pop(executor_id, None)
+        getattr(self, "_persisted_child_order_ids", {}).pop(executor_id, None)
+        log_capture = getattr(self, "_log_capture", None)
+        if log_capture is not None:
+            try:
+                log_capture.clear(executor_id)
+            except Exception:
+                logger.debug(f"Could not clear logs for executor {executor_id}", exc_info=True)
+
+    def _executor_connector(self, executor_id: str, executor: Any) -> Any:
+        connectors = getattr(executor, "connectors", None)
+        if not isinstance(connectors, dict) or not connectors:
+            return None
+        meta = self._executor_metadata.get(executor_id, {})
+        name = meta.get("connector_name") or getattr(
+            getattr(executor, "config", None), "connector_name", None
+        )
+        if name and name in connectors:
+            return connectors[name]
+        if len(connectors) == 1:
+            return next(iter(connectors.values()))
+        return None
+
+    def _cancel_checker(self, connector: Any):
+        if connector is None:
+            return None
+        checker = getattr(connector, "is_cancel_confirmed", None)
+        if checker is None or not callable(checker):
+            return None
+        return checker
+
+    def _orders_awaiting_cancel_confirmation(self, executor_id: str, executor: Any) -> List[str]:
+        """Child orders whose cancel the connector has not confirmed.
+
+        Connectors without is_cancel_confirmed cannot be waited on. Range iceberg
+        treats that as confirmed, and so does this wait.
+        """
+        connector = self._executor_connector(executor_id, executor)
+        checker = self._cancel_checker(connector)
+        if checker is None:
+            return []
+
+        explicit = getattr(executor, "_unconfirmed_cancels", None)
+        if isinstance(explicit, (set, list, tuple)):
+            candidates = list(explicit)
+        else:
+            info = self._safe_custom_info(executor)
+            working, _filled = child_order_ids_from_custom_info(info)
+            book = getattr(connector, "in_flight_orders", None)
+            if isinstance(book, dict):
+                candidates = [
+                    oid for oid in working
+                    if oid in book and _inflight_is_open(book[oid])
+                ]
+            else:
+                candidates = list(working)
+
+        pending: List[str] = []
+        seen: set = set()
+        for oid in candidates:
+            if not isinstance(oid, str) or oid in _SKIP_ORDER_IDS or oid in seen:
+                continue
+            seen.add(oid)
+            try:
+                confirmed = bool(checker(oid))
+            except Exception:
+                logger.debug(
+                    f"Cancel confirmation check failed for {oid} on executor {executor_id}",
+                    exc_info=True,
+                )
+                confirmed = False
+            if not confirmed:
+                pending.append(oid)
+        return pending
+
+    async def _wait_for_cancel_confirmations(self, executor_ids: List[str]) -> Dict[str, List[str]]:
+        """Poll until every shutdown cancel is confirmed, or the timeout elapses."""
+        deadline = time.monotonic() + self.SHUTDOWN_CANCEL_TIMEOUT_SECONDS
+        still: Dict[str, List[str]] = {}
+        while True:
+            still = {}
+            for executor_id in executor_ids:
+                executor = self._active_executors.get(executor_id)
+                if executor is None:
+                    continue
+                pending = self._orders_awaiting_cancel_confirmation(executor_id, executor)
+                if pending:
+                    still[executor_id] = pending
+                elif (
+                    self._cancel_checker(self._executor_connector(executor_id, executor)) is None
+                    and not self._executor_is_closed(executor)
+                ):
+                    # No confirmation hook. Keep waiting so the executor's own loop can
+                    # send the cancels. An empty list means "not finished", not "no orders".
+                    still[executor_id] = []
+            if not still or time.monotonic() >= deadline:
+                return still
+            await asyncio.sleep(self.SHUTDOWN_CANCEL_POLL_SECONDS)
+
+    def _account_connector(self, account_name: str, connector_name: str) -> Any:
+        trading = self._trading_service
+        service = getattr(trading, "connector_service", None) if trading is not None else None
+        if service is None:
+            return None
+        getter = getattr(service, "get_account_connectors", None)
+        if getter is None:
+            return None
+        try:
+            connectors = getter(account_name) or {}
+        except Exception:
+            logger.error(
+                f"Could not read connectors for account {account_name}",
+                exc_info=True,
+            )
+            return None
+        if not isinstance(connectors, dict):
+            return None
+        return connectors.get(connector_name)
+
+    @staticmethod
+    def _safe_custom_info(executor: Any) -> Dict[str, Any]:
+        getter = getattr(executor, "get_custom_info", None)
+        if not callable(getter):
+            return {}
+        try:
+            info = getter()
+        except Exception:
+            logger.debug("Could not read executor custom_info", exc_info=True)
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    async def _persist_running_child_orders(self, executor_id: str, executor: Any) -> None:
+        """Store the working child order ids and the custom_info that lists them.
+
+        An unclean shutdown reads this back. The snapshot is skipped when the id
+        set has not changed since the last successful write.
+        """
+        if not self.db_manager:
+            return
+        cache = getattr(self, "_persisted_child_order_ids", None)
+        if cache is None:
+            cache = {}
+            self._persisted_child_order_ids = cache
+
+        # A failed read is not an empty book. Treating it as one would mark every
+        # stored child DONE, and the next startup would leave those orders open.
+        getter = getattr(executor, "get_custom_info", None)
+        if not callable(getter):
+            return
+        try:
+            info = getter()
+        except Exception:
+            logger.error(
+                f"Could not read custom_info for executor {executor_id}; keeping the last child-order snapshot",
+                exc_info=True,
+            )
+            return
+        if not isinstance(info, dict):
+            return
+        working, _filled = child_order_ids_from_custom_info(info)
+        signature = tuple(working)
+        if cache.get(executor_id) == signature:
+            return
+
+        side = info.get("side") or "BUY"
+        trade_type = side.name if hasattr(side, "name") else str(side)
+        try:
+            final_state_json = json.dumps(info, default=_json_default)
+        except Exception as e:
+            logger.warning(f"Could not serialize custom_info for {executor_id}: {e}")
+            final_state_json = None
+
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                existing = {
+                    row.client_order_id: row
+                    for row in await repo.get_executor_orders(executor_id)
+                }
+                for oid in working:
+                    row = existing.get(oid)
+                    if row is None:
+                        await repo.create_executor_order(
+                            executor_id=executor_id,
+                            client_order_id=oid,
+                            order_type="child",
+                            trade_type=trade_type,
+                            amount=Decimal("0"),
+                            status="OPEN",
+                        )
+                    elif (row.status or "").upper() in _TERMINAL_ORDER_STATUSES:
+                        await repo.update_executor_order(oid, status="OPEN")
+                for oid, row in existing.items():
+                    if oid not in signature and (row.status or "").upper() not in _TERMINAL_ORDER_STATUSES:
+                        await repo.update_executor_order(oid, status="DONE")
+                if final_state_json is not None:
+                    await repo.update_executor(executor_id, final_state=final_state_json)
+            cache[executor_id] = signature
+        except Exception as e:
+            logger.error(f"Error persisting child orders for executor {executor_id}: {e}")
+
+    async def _cancel_orphaned_child_orders(self, active_executor_ids: List[str]) -> None:
+        """Cancel child orders still open for RUNNING executors that have no owner.
+
+        Order ids come from executor_orders and from the custom_info snapshot stored
+        on the executor row. Filled orders are left alone. Nothing here starts an
+        executor again.
+        """
+        if not self.db_manager:
+            return
+
+        active = set(active_executor_ids)
+        pending: List[Dict[str, Any]] = []
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            order_repo = OrderRepository(session)
+            running = await repo.get_active_executors()
+            for record in running:
+                if record.executor_id in active:
+                    continue
+                custom: Dict[str, Any] = {}
+                if record.final_state:
+                    try:
+                        parsed = json.loads(record.final_state)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        custom = parsed
+                working, filled = child_order_ids_from_custom_info(custom)
+                order_ids = list(working)
+                seen = set(order_ids)
+                for row in await repo.get_executor_orders(record.executor_id):
+                    oid = row.client_order_id
+                    if not oid or oid in seen or oid in _SKIP_ORDER_IDS:
+                        continue
+                    if (row.status or "").upper() in _TERMINAL_ORDER_STATUSES:
+                        continue
+                    seen.add(oid)
+                    order_ids.append(oid)
+                if not order_ids:
+                    continue
+                db_orders = await order_repo.get_orders_by_client_ids(order_ids)
+                db_status = {row.client_order_id: row.status for row in db_orders}
+                pending.append({
+                    "executor_id": record.executor_id,
+                    "account_name": record.account_name,
+                    "connector_name": record.connector_name,
+                    "trading_pair": record.trading_pair,
+                    "order_ids": order_ids,
+                    "filled_ids": set(filled),
+                    "db_status": db_status,
+                })
+
+        for item in pending:
+            connector = self._account_connector(item["account_name"], item["connector_name"])
+            book = getattr(connector, "in_flight_orders", None) if connector is not None else None
+            if not isinstance(book, dict):
+                book = {}
+            for order_id in item["order_ids"]:
+                if order_id in item["filled_ids"]:
+                    continue
+                if not self._child_order_still_open(order_id, book, item["db_status"].get(order_id)):
+                    continue
+                try:
+                    await self._cancel_on_connector(connector, item["trading_pair"], order_id)
+                except Exception as e:
+                    logger.error(
+                        "Failed to cancel open child order %s for executor %s on %s %s: %s",
+                        order_id,
+                        item["executor_id"],
+                        item["connector_name"],
+                        item["trading_pair"],
+                        e,
+                    )
+                    continue
+                logger.info(
+                    "Cancelled open child order %s for executor %s on %s %s before SYSTEM_CLEANUP",
+                    order_id,
+                    item["executor_id"],
+                    item["connector_name"],
+                    item["trading_pair"],
+                )
+
+    @staticmethod
+    def _child_order_still_open(order_id: str, book: Dict[str, Any], db_status: Optional[str]) -> bool:
+        inflight = book.get(order_id)
+        if inflight is not None:
+            return _inflight_is_open(inflight)
+        return _order_status_is_open(db_status)
+
+    @staticmethod
+    async def _cancel_on_connector(connector: Any, trading_pair: str, order_id: str) -> None:
+        if connector is None:
+            raise RuntimeError(f"connector is not loaded; cannot cancel {order_id}")
+        cancel = getattr(connector, "cancel", None)
+        if cancel is None or not callable(cancel):
+            raise RuntimeError(f"connector cannot cancel {order_id}")
+        try:
+            result = cancel(trading_pair=trading_pair, client_order_id=order_id)
+        except TypeError:
+            result = cancel(trading_pair, order_id)
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _control_loop(self):
         """Main control loop that updates all active executors."""
@@ -352,7 +874,11 @@ class ExecutorService:
                 for executor_id, executor in list(self._active_executors.items()):
                     if executor.is_closed:
                         completed_ids.append(executor_id)
-                    elif (
+                        continue
+                    # Child order ids have to be on disk before a crash, or the next
+                    # startup cannot tell which open orders belonged to this executor.
+                    await self._persist_running_child_orders(executor_id, executor)
+                    if (
                         self._executor_metadata.get(executor_id, {}).get("executor_type") == "lp_executor"
                         and executor_id not in self._lp_rent_recorded
                         and time.monotonic() >= self._lp_rent_retry_after.get(executor_id, 0.0)
@@ -1274,6 +1800,7 @@ class ExecutorService:
         self._lp_position_addresses.pop(executor_id, None)
         self._lp_rent_recorded.discard(executor_id)
         self._lp_rent_retry_after.pop(executor_id, None)
+        getattr(self, "_persisted_child_order_ids", {}).pop(executor_id, None)
 
         # Active executor already claimed via pop above; drop its metadata last
         # (metadata is read above and re-fetched inside the persist/aggregate
