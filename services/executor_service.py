@@ -407,7 +407,9 @@ def _exit_only_custom_info(
 
     ``size_unit`` is BASE. ``open_base`` is the position the exit may close.
     Entry quote is that base times the entry average. Startup still cancels
-    the old client order ids from the saved row.
+    the old client order ids from the saved row. ``exchange_stop_released``,
+    when the saved info has it, is copied onto the top level and the exit
+    section so a resumed stop-loss close does not place a new exchange stop.
     """
     amount = format(open_base, "f")
     quote = "0" if average is None or average <= 0 else format(open_base * average, "f")
@@ -454,6 +456,15 @@ def _exit_only_custom_info(
         "started_at": exit_blob.get("started_at"),
         "paused_seconds": exit_blob.get("paused_seconds") or 0,
     }
+    if "exchange_stop_released" in custom:
+        released = custom.get("exchange_stop_released")
+    elif "exchange_stop_released" in exit_blob:
+        released = exit_blob.get("exchange_stop_released")
+    else:
+        released = None
+    if "exchange_stop_released" in custom or "exchange_stop_released" in exit_blob:
+        payload["exchange_stop_released"] = released
+        payload["exit"]["exchange_stop_released"] = released
     return payload
 
 

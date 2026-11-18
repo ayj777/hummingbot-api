@@ -34,6 +34,7 @@ from database.repositories.order_repository import OrderRepository
 from services.executor_service import (
     ExecutorService,
     _exchange_stop_ids,
+    _exit_only_custom_info,
     child_order_ids_from_custom_info,
     range_iceberg_held_base,
 )
@@ -1909,3 +1910,48 @@ async def test_direct_cancel_false_and_gone_is_already_gone(db, caplog):
     assert "Failed to cancel open child order stuck-oid" in caplog.text
     assert "was rejected" in caplog.text
     assert "Software order stuck-oid" not in caplog.text
+
+
+def test_resume_payload_keeps_exchange_stop_released():
+    released = _exit_only_custom_info(
+        {
+            "side": "BUY",
+            "exit_state": "CLOSING",
+            "exchange_stop_released": True,
+            "exit": {"exchange_stop_released": True, "active": "stop_loss"},
+            "filled_base": "1",
+            "filled_quote": "1",
+        },
+        Decimal("1"),
+        Decimal("1"),
+    )
+    assert released["exchange_stop_released"] is True
+    assert released["exit"]["exchange_stop_released"] is True
+
+    from_exit_only = _exit_only_custom_info(
+        {
+            "side": "BUY",
+            "exit_state": "CLOSING",
+            "exit": {"exchange_stop_released": True},
+            "filled_base": "1",
+            "filled_quote": "1",
+        },
+        Decimal("1"),
+        Decimal("1"),
+    )
+    assert from_exit_only["exchange_stop_released"] is True
+    assert from_exit_only["exit"]["exchange_stop_released"] is True
+
+    absent = _exit_only_custom_info(
+        {
+            "side": "BUY",
+            "exit_state": "RESTING",
+            "exit": {"active": "take_profit"},
+            "filled_base": "1",
+            "filled_quote": "1",
+        },
+        Decimal("1"),
+        Decimal("1"),
+    )
+    assert absent.get("exchange_stop_released") in (None, False)
+    assert absent["exit"].get("exchange_stop_released") in (None, False)
