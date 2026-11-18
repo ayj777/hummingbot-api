@@ -9,7 +9,9 @@ torn down. An unclean shutdown leaves the row RUNNING; startup cancels child ord
 still open on the exchange, using the persisted executor_orders rows and custom_info,
 and only then marks the row SYSTEM_CLEANUP. A range iceberg saved with
 resume_on_startup and exit_state ARMED, RESTING, or CLOSING is resumed before
-that cleanup. Every other leftover is still cancelled.
+that cleanup. Resuming continues exits only, on the exchange position, and
+does not continue an unfinished entry. Cleanup still cancels that executor's
+entry and exit client order ids. Only its exchange stop stays up.
 """
 
 import asyncio
@@ -745,13 +747,20 @@ def test_range_iceberg_held_base_prefers_open_base():
 
 
 class _CancellingExecutor(_Executor):
-    """early_stop stands in for the real call that pulls the exchange stop."""
+    """early_stop cancels software entry and exit orders and leaves the exchange stop."""
 
     def early_stop(self, keep_position=True):
         super().early_stop(keep_position=keep_position)
         connector = next(iter(self.connectors.values()), None)
-        if connector is not None:
-            connector.cancels.append(("BTC-USDT", "stop-1"))
+        if connector is None:
+            return
+        info = self.get_custom_info()
+        stop_id = info.get("exchange_stop_order_id")
+        seen = set()
+        for oid in list(info.get("child_order_ids") or []) + list(info.get("exit_order_ids") or []):
+            if oid and oid != stop_id and oid not in seen:
+                seen.add(oid)
+                connector.cancels.append(("BTC-USDT", oid))
 
 
 def _iceberg_custom(exit_state, **extra):
@@ -812,9 +821,12 @@ async def test_graceful_shutdown_persists_resumable_icebergs(db, caplog, exit_st
     stored = json.loads(next(row.final_state for row in db.query(ExecutorRecord) if row.executor_id == "ex-1"))
     row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "ex-1")
     if park:
-        assert executor.early_kwargs == []
-        assert connector.cancels == []
-        assert "early_stop" not in events
+        assert executor.early_kwargs == [True]
+        assert ("BTC-USDT", "entry-1") in connector.cancels
+        assert ("BTC-USDT", "tp-1") in connector.cancels
+        assert ("BTC-USDT", "stop-1") not in connector.cancels
+        assert "early_stop" in events
+        assert ("completion", "POSITION_HOLD") not in events
         assert stored["resume_on_startup"] is True
         assert stored["exit_state"] == exit_state
         assert stored["exchange_stop_order_id"] == "stop-1"
@@ -827,7 +839,9 @@ async def test_graceful_shutdown_persists_resumable_icebergs(db, caplog, exit_st
         assert exit_rows and exit_rows[0].status == "OPEN"
     else:
         assert executor.early_kwargs == [True]
-        assert connector.cancels == [("BTC-USDT", "stop-1")]
+        assert ("BTC-USDT", "entry-1") in connector.cancels
+        assert ("BTC-USDT", "tp-1") in connector.cancels
+        assert ("BTC-USDT", "stop-1") not in connector.cancels
         assert stored.get("resume_on_startup") is not True
         assert ("completion", "POSITION_HOLD") in events
 
@@ -902,6 +916,7 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
         {
             "resume_on_startup": True,
             "exit_state": "RESTING",
+            "side": "BUY",
             "child_order_ids": ["entry-1"],
             "exit_order_ids": ["tp-child"],
             "exchange_stop_order_id": "stop-1",
@@ -913,8 +928,12 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
             "type": "range_iceberg_executor",
             "connector_name": "mexc_perpetual",
             "trading_pair": "BTC-USDT",
-            "exchange_stop": True,
-            "exit_retry_budget": 4,
+            "side": "BUY",
+            "protective_exchange_stop": True,
+            "stop_loss_fallback_seconds": 30,
+            "allow_adverse_take_profit": False,
+            "protective_stop_buffer_pct": "0.1",
+            "exchange_stop_trigger_price": "100",
         },
     )
     await _seed_iceberg_row(
@@ -951,6 +970,13 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
         },
     )
     connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal("1.5"),
+        )
+    }
     for order_id in ("entry-1", "tp-child", "stop-1", "crash-entry", "crash-tp", "crash-stop", "closed-stop", "naked-stop"):
         connector.in_flight_orders[order_id] = _open_order()
         await _seed_exchange_order(db, order_id, "OPEN")
@@ -962,8 +988,8 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
         await service.cleanup_orphaned_executors()
 
     cancelled = {order_id for _pair, order_id in connector.cancels}
-    assert "entry-1" not in cancelled
-    assert "tp-child" not in cancelled
+    assert "entry-1" in cancelled
+    assert "tp-child" in cancelled
     assert "stop-1" not in cancelled
     assert "crash-tp" in cancelled
     assert "crash-entry" in cancelled
@@ -979,11 +1005,18 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
     resumed = service._active_executors["resume-1"]
     assert resumed.started is True
     assert resumed.restored["exit_state"] == "RESTING"
-    assert resumed.restored["exit_order_ids"] == ["tp-child"]
+    assert resumed.restored["resume_entries"] is False
+    assert resumed.restored["exit_order_ids"] == []
+    assert resumed.restored["child_order_ids"] == []
+    assert resumed.restored["open_base"] == "1.5"
     assert "resume_on_startup" not in resumed.restored
     assert resumed.config.id == "resume-1"
-    assert resumed.config.exchange_stop is True
-    assert resumed.config.exit_retry_budget == 4
+    assert resumed.config.total_amount == "1.5"
+    assert resumed.config.protective_exchange_stop is True
+    assert resumed.config.stop_loss_fallback_seconds == 30
+    assert resumed.config.allow_adverse_take_profit is False
+    assert resumed.config.protective_stop_buffer_pct == "0.1"
+    assert resumed.config.exchange_stop_trigger_price == "100"
 
     rows = {row.executor_id: row for row in db.query(ExecutorRecord)}
     assert rows["resume-1"].status == "RUNNING"
@@ -1002,11 +1035,19 @@ async def test_failed_resume_leaves_the_exchange_stop_and_marks_the_row(db, capl
             "resume_on_startup": True,
             "exit_state": "ARMED",
             "exit_order_ids": ["tp-fail"],
+            "side": "BUY",
             "exchange_stop_order_id": "stop-fail",
             "open_base": "1",
         },
     )
     connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal("1"),
+        )
+    }
     connector.in_flight_orders["tp-fail"] = _open_order()
     connector.in_flight_orders["stop-fail"] = _open_order()
     await _seed_exchange_order(db, "tp-fail", "OPEN")
@@ -1122,7 +1163,7 @@ def test_search_record_keeps_range_iceberg_custom_info_fields():
         assert formatted["custom_info"][key] == value
 
 
-def test_validate_forwards_exchange_stop_and_exit_retry_budget():
+def test_validate_forwards_protective_stop_fields():
     service = _service()
 
     class _Config:
@@ -1136,11 +1177,233 @@ def test_validate_forwards_exchange_stop_and_exit_retry_budget():
             "type": "range_iceberg_executor",
             "connector_name": "mexc_perpetual",
             "trading_pair": "BTC-USDT",
-            "exchange_stop": True,
-            "exit_retry_budget": 4,
+            "protective_exchange_stop": True,
+            "stop_loss_fallback_seconds": 30,
+            "allow_adverse_take_profit": False,
+            "protective_stop_buffer_pct": "0.1",
+            "exchange_stop_trigger_price": "100",
             "timestamp": 10,
         }
     )
-    assert typed.exchange_stop is True
-    assert typed.exit_retry_budget == 4
+    assert typed.protective_exchange_stop is True
+    assert typed.stop_loss_fallback_seconds == 30
+    assert typed.allow_adverse_take_profit is False
+    assert typed.protective_stop_buffer_pct == "0.1"
+    assert typed.exchange_stop_trigger_price == "100"
     assert typed.connector_name == "mexc_perpetual"
+
+
+def _long_position(amount):
+    return {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal(str(amount)),
+        )
+    }
+
+
+async def _resume_with_position(db, executor_id, final_state, amount, caplog):
+    await _seed_iceberg_row(db, executor_id, final_state)
+    connector = _Connector()
+    connector.account_positions = _long_position(amount)
+    for order_id in ("entry-x", "tp-x", "stop-x"):
+        connector.in_flight_orders[order_id] = _open_order()
+        await _seed_exchange_order(db, order_id, "OPEN")
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    return service, connector
+
+
+@pytest.mark.asyncio
+async def test_flat_exchange_position_is_not_resumed_and_its_stop_is_cancelled(db, caplog):
+    final_state = {
+        "resume_on_startup": True,
+        "exit_state": "RESTING",
+        "side": "BUY",
+        "child_order_ids": ["entry-x"],
+        "exit_order_ids": ["tp-x"],
+        "exchange_stop_order_id": "stop-x",
+        "open_base": "1.5",
+    }
+    service, connector = await _resume_with_position(db, "flat-1", final_state, "0", caplog)
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "entry-x" in cancelled
+    assert "tp-x" in cancelled
+    assert "stop-x" in cancelled
+    assert "flat-1" not in service._active_executors
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "flat-1")
+    assert row.status == "TERMINATED"
+    assert row.close_type == "CLOSED_WHILE_DOWN"
+    stored = json.loads(row.final_state)
+    assert stored["closed_while_down"] is True
+    assert "flat" in caplog.text
+    assert "was flat while the API was down" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_the_smaller_exchange_position(db, caplog):
+    final_state = {
+        "resume_on_startup": True,
+        "exit_state": "ARMED",
+        "side": "BUY",
+        "child_order_ids": ["entry-x"],
+        "exit_order_ids": ["tp-x"],
+        "exchange_stop_order_id": "stop-x",
+        "open_base": "2",
+        "filled_base": "2",
+        "closed_base": "0",
+    }
+    service, connector = await _resume_with_position(db, "small-1", final_state, "0.5", caplog)
+    resumed = service._active_executors["small-1"]
+    assert resumed.restored["open_base"] == "0.5"
+    assert resumed.restored["resume_entries"] is False
+    assert resumed.restored["exit_order_ids"] == []
+    assert resumed.config.total_amount == "0.5"
+    assert "stop-x" not in {order_id for _pair, order_id in connector.cancels}
+    assert "entry-x" in {order_id for _pair, order_id in connector.cancels}
+    assert "smaller than saved open_base" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resume_caps_at_saved_open_base_when_the_exchange_is_larger(db, caplog):
+    final_state = {
+        "resume_on_startup": True,
+        "exit_state": "CLOSING",
+        "side": "BUY",
+        "exit_order_ids": ["tp-x"],
+        "exchange_stop_order_id": "stop-x",
+        "open_base": "1",
+    }
+    service, connector = await _resume_with_position(db, "large-1", final_state, "4", caplog)
+    resumed = service._active_executors["large-1"]
+    assert resumed.restored["open_base"] == "1"
+    assert resumed.config.total_amount == "1"
+    assert "stop-x" not in {order_id for _pair, order_id in connector.cancels}
+    assert "larger than saved open_base" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unreadable_exchange_position_leaves_the_stop(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "blind-1",
+        {
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "side": "BUY",
+            "exchange_stop_order_id": "stop-blind",
+            "exit_order_ids": ["tp-blind"],
+            "open_base": "1",
+        },
+    )
+    connector = _Connector()
+    connector.in_flight_orders["stop-blind"] = _open_order()
+    connector.in_flight_orders["tp-blind"] = _open_order()
+    await _seed_exchange_order(db, "stop-blind", "OPEN")
+    await _seed_exchange_order(db, "tp-blind", "OPEN")
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.ERROR):
+        await service.cleanup_orphaned_executors()
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "stop-blind" not in cancelled
+    assert "tp-blind" in cancelled
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "blind-1")
+    stored = json.loads(row.final_state)
+    assert stored["resume_failed"] is True
+    assert "could not read the exchange position" in stored["resume_error"]
+    assert "blind-1" not in service._active_executors
+
+
+@pytest.mark.asyncio
+async def test_stop_without_keep_position_cancels_the_exchange_stop():
+    connector = _Connector()
+    connector.in_flight_orders["stop-1"] = _open_order()
+    executor = _Executor([], custom_info={
+        "exchange_stop_order_id": "stop-1",
+        "exit_order_ids": ["tp-1"],
+        "open_base": "1",
+        "side": "BUY",
+    })
+    service = _service(connectors={"master": {"mexc_perpetual": connector}})
+    metadata = {
+        "account_name": "master",
+        "connector_name": "mexc_perpetual",
+        "trading_pair": "BTC-USDT",
+        "executor_type": "range_iceberg_executor",
+    }
+    service._active_executors["ex-1"] = executor
+    service._executor_metadata["ex-1"] = metadata
+    await service.stop_executor("ex-1", keep_position=False)
+    assert executor.early_kwargs == [False]
+    assert ("BTC-USDT", "stop-1") in connector.cancels
+
+    connector.cancels.clear()
+    kept = _Executor([], custom_info={"exchange_stop_order_id": "stop-1", "open_base": "1"})
+    service._active_executors["ex-2"] = kept
+    service._executor_metadata["ex-2"] = metadata
+    await service.stop_executor("ex-2", keep_position=True)
+    assert kept.early_kwargs == [True]
+    assert connector.cancels == []
+
+
+@pytest.mark.asyncio
+async def test_startup_cancels_exchange_stop_on_a_finished_executor(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "failed-stop",
+        {
+            "exit_state": "DONE",
+            "exchange_stop_order_id": "stop-failed",
+            "open_base": "1",
+            "side": "BUY",
+        },
+    )
+    await _seed_iceberg_row(
+        db,
+        "held-stop",
+        {
+            "exit_state": "RESTING",
+            "exchange_stop_order_id": "stop-held",
+            "open_base": "1",
+            "side": "BUY",
+        },
+    )
+    async with db.session_context() as session:
+        repo = ExecutorRepository(session)
+        await repo.update_executor("failed-stop", status="TERMINATED", close_type="FAILED")
+        await repo.update_executor("held-stop", status="TERMINATED", close_type="POSITION_HOLD")
+    connector = _Connector()
+    connector.in_flight_orders["stop-failed"] = _open_order()
+    connector.in_flight_orders["stop-held"] = _open_order()
+    await _seed_exchange_order(db, "stop-failed", "OPEN")
+    await _seed_exchange_order(db, "stop-held", "OPEN")
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "stop-failed" in cancelled
+    assert "stop-held" not in cancelled
+    assert "not RUNNING and was not parked for resume" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_keep_position_quote_matches_open_base():
+    service = _service()
+    info = {
+        "open_base": "1",
+        "filled_base": "4",
+        "filled_quote": "400",
+        "average_fill_price": "90",
+        "side": "BUY",
+    }
+    executor = _HoldExecutor(info, filled_amount_base=Decimal("4"))
+    executor.filled_amount_quote = Decimal("400")
+    await service._aggregate_position_hold("ex-1", executor, _hold_metadata("range_iceberg_executor"))
+    position = next(iter(service._positions_held.values()))
+    assert position.buy_amount_base == Decimal("1")
+    assert position.buy_amount_quote == Decimal("90")
+    assert position.executor_ids == ["ex-1"]

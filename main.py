@@ -345,8 +345,9 @@ async def lifespan(app: FastAPI):
     market_data_service.start()
     await market_data_service.warmup_tickers()
     executor_service.start()
-    # Resumes range icebergs saved on graceful shutdown, then cancels orders
-    # left by every other RUNNING row.
+    # Resumes range icebergs saved on graceful shutdown, then cancels leftover
+    # software orders, including those of the resumed executors. Only a resumed
+    # executor's exchange stop stays up.
     await executor_service.cleanup_orphaned_executors()
     await executor_service.recover_positions_from_db()
     accounts_service.start()
