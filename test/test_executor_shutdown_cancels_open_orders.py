@@ -132,9 +132,11 @@ class _Connector:
     def __init__(self, confirmed=False):
         self.in_flight_orders = {}
         self.cancels = []
+        self.stop_cancels = []
         self.closes = []
         self.confirmed = confirmed
         self._confirm_events = None
+        self.stop_result = None
 
     def is_cancel_confirmed(self, order_id):
         confirmed = self.confirmed is True or (isinstance(self.confirmed, set) and order_id in self.confirmed)
@@ -145,6 +147,17 @@ class _Connector:
 
     async def cancel(self, trading_pair=None, client_order_id=None):
         self.cancels.append((trading_pair, client_order_id))
+
+    async def cancel_stop_orders(self, stop_ids):
+        self.stop_cancels.extend(list(stop_ids))
+        if self.stop_result is not None:
+            return self.stop_result
+        for stop_id in stop_ids:
+            self.in_flight_orders.pop(stop_id, None)
+        return {"success": True, "code": 0, "data": [{"stopPlanOrderId": stop_id, "errorCode": 0} for stop_id in stop_ids]}
+
+    async def list_open_stop_orders(self, trading_pair=None):
+        return [{"id": order_id} for order_id in self.in_flight_orders if "stop" in str(order_id)]
 
     async def buy(self, *args, **kwargs):
         self.closes.append(("buy", args, kwargs))
@@ -994,7 +1007,10 @@ async def test_startup_resumes_saved_iceberg_and_cancels_the_rest(db, caplog):
     assert "crash-tp" in cancelled
     assert "crash-entry" in cancelled
     assert "crash-stop" not in cancelled
-    assert "closed-stop" in cancelled
+    assert "closed-stop" not in cancelled
+    assert "closed-stop" in connector.stop_cancels
+    assert "stop-1" not in connector.stop_cancels
+    assert "crash-stop" not in connector.stop_cancels
     assert "naked-stop" not in cancelled
     assert (
         "Cancelled exchange stop closed-stop for executor closed-1 "
@@ -1232,7 +1248,8 @@ async def test_flat_exchange_position_is_not_resumed_and_its_stop_is_cancelled(d
     cancelled = {order_id for _pair, order_id in connector.cancels}
     assert "entry-x" in cancelled
     assert "tp-x" in cancelled
-    assert "stop-x" in cancelled
+    assert "stop-x" not in cancelled
+    assert "stop-x" in connector.stop_cancels
     assert "flat-1" not in service._active_executors
     row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "flat-1")
     assert row.status == "TERMINATED"
@@ -1264,7 +1281,7 @@ async def test_resume_uses_the_smaller_exchange_position(db, caplog):
     assert resumed.config.total_amount == "0.5"
     assert "stop-x" not in {order_id for _pair, order_id in connector.cancels}
     assert "entry-x" in {order_id for _pair, order_id in connector.cancels}
-    assert "smaller than saved open_base" in caplog.text
+    assert "Allocated 0.5 of exchange position 0.5" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1339,7 +1356,8 @@ async def test_stop_without_keep_position_cancels_the_exchange_stop():
     service._executor_metadata["ex-1"] = metadata
     await service.stop_executor("ex-1", keep_position=False)
     assert executor.early_kwargs == [False]
-    assert ("BTC-USDT", "stop-1") in connector.cancels
+    assert connector.cancels == []
+    assert connector.stop_cancels == ["stop-1"]
 
     connector.cancels.clear()
     kept = _Executor([], custom_info={"exchange_stop_order_id": "stop-1", "open_base": "1"})
@@ -1385,8 +1403,10 @@ async def test_startup_cancels_exchange_stop_on_a_finished_executor(db, caplog):
     with caplog.at_level(logging.INFO):
         await service.cleanup_orphaned_executors()
     cancelled = {order_id for _pair, order_id in connector.cancels}
-    assert "stop-failed" in cancelled
+    assert "stop-failed" not in cancelled
+    assert connector.stop_cancels == ["stop-failed"]
     assert "stop-held" not in cancelled
+    assert "stop-held" not in connector.stop_cancels
     assert "not RUNNING and was not parked for resume" in caplog.text
 
 
@@ -1407,3 +1427,257 @@ async def test_keep_position_quote_matches_open_base():
     assert position.buy_amount_base == Decimal("1")
     assert position.buy_amount_quote == Decimal("90")
     assert position.executor_ids == ["ex-1"]
+
+
+@pytest.mark.asyncio
+async def test_quote_sized_executor_resumes_in_base(db, caplog):
+    """A QUOTE total_amount must not be reused as the open base."""
+    await _seed_iceberg_row(
+        db,
+        "quote-1",
+        {
+            "resume_on_startup": True,
+            "exit_state": "ARMED",
+            "side": "BUY",
+            "open_base": "50",
+            "filled_base": "50",
+            "filled_quote": "8.5",
+            "exchange_stop_order_id": "stop-x",
+        },
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "BUY",
+            "size_unit": "QUOTE",
+            "total_amount": "8.5",
+        },
+    )
+    connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal("50"),
+            entry_price=Decimal("0.17"),
+        )
+    }
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    resumed = service._active_executors["quote-1"]
+    assert resumed.config.size_unit == "BASE"
+    assert resumed.config.total_amount == "50"
+    assert resumed.config.resume_entries is False
+    assert resumed.restored["size_unit"] == "BASE"
+    assert resumed.restored["resume_entries"] is False
+    assert Decimal(resumed.restored["open_base"]) == Decimal("50")
+    assert Decimal(resumed.restored["filled_quote"]) == Decimal("8.5")
+
+
+@pytest.mark.asyncio
+async def test_partial_take_profit_resumes_on_the_entry_average(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "tp-1",
+        {
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "side": "BUY",
+            "open_base": "20",
+            "filled_base": "60",
+            "closed_base": "40",
+            "filled_quote": "5.1",
+            "average_fill_price": "0.085",
+            "exchange_stop_order_id": "stop-x",
+            "exit_order_ids": ["tp-x"],
+            "exit": {
+                "active": "take_profit",
+                "status": "resting",
+                "entry_filled_base": "60",
+                "entry_filled_quote": "5.1",
+                "filled_base": "40",
+                "filled_quote": "5.668",
+                "filled_by_order": {"tp-x": {"base": "40", "quote": "5.668"}},
+                "order_ids": ["tp-x"],
+            },
+        },
+    )
+    connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal("20"),
+            entry_price=Decimal("0.085"),
+        )
+    }
+    connector.in_flight_orders["tp-x"] = _open_order()
+    await _seed_exchange_order(db, "tp-x", "OPEN")
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    resumed = service._active_executors["tp-1"]
+    assert Decimal(resumed.restored["filled_base"]) == Decimal("20")
+    assert Decimal(resumed.restored["closed_base"]) == Decimal("0")
+    assert Decimal(resumed.restored["open_base"]) == Decimal("20")
+    assert Decimal(resumed.restored["average_fill_price"]) == Decimal("0.085")
+    assert Decimal(resumed.restored["filled_quote"]) == Decimal("1.7")
+    assert resumed.restored["exit"]["filled_by_order"] == {}
+    assert Decimal(resumed.restored["exit"]["entry_filled_base"]) == Decimal("20")
+    assert Decimal(resumed.restored["exit"]["entry_filled_quote"]) == Decimal("1.7")
+    assert Decimal(resumed.restored["exit"]["filled_base"]) == Decimal("0")
+    assert Decimal(resumed.restored["exit"]["filled_quote"]) == Decimal("0")
+    assert resumed.restored["exit_order_ids"] == []
+    assert resumed.config.size_unit == "BASE"
+    assert resumed.config.resume_entries is False
+    # 5.668 / 40 is the stale take-profit price. It must not become the entry.
+    assert Decimal(resumed.restored["average_fill_price"]) != Decimal("0.1417")
+
+
+@pytest.mark.asyncio
+async def test_two_parked_executors_share_one_position(db, caplog):
+    first = {
+        "resume_on_startup": True,
+        "exit_state": "ARMED",
+        "side": "BUY",
+        "open_base": "2",
+        "filled_base": "2",
+        "filled_quote": "2",
+        "exchange_stop_order_id": "stop-x",
+    }
+    second = dict(first)
+    second["exchange_stop_order_id"] = "stop-y"
+    await _seed_iceberg_row(db, "share-1", first)
+    await _seed_iceberg_row(db, "share-2", second)
+    connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal("3"),
+            entry_price=Decimal("1"),
+        )
+    }
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    first_exec = service._active_executors["share-1"]
+    second_exec = service._active_executors["share-2"]
+    assert Decimal(first_exec.restored["open_base"]) == Decimal("2")
+    assert Decimal(second_exec.restored["open_base"]) == Decimal("1")
+    total = Decimal(first_exec.config.total_amount) + Decimal(second_exec.config.total_amount)
+    assert total == Decimal("3")
+    assert "Allocated exchange position 3" in caplog.text
+    assert "share-1=2" in caplog.text
+    assert "share-2=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_untracked_software_order_is_cancelled_by_exchange_id(db, caplog):
+    await _seed_executor(
+        db,
+        "orphan-direct",
+        "master",
+        "mexc_perpetual",
+        "BTC-USDT",
+        {"child_order_ids": ["orphan-oid"], "exit_order_ids": ["exit-oid"]},
+        [("orphan-oid", "OPEN"), ("exit-oid", "OPEN")],
+    )
+    await _seed_exchange_order(db, "orphan-oid", "OPEN")
+    await _seed_exchange_order(db, "exit-oid", "OPEN")
+    async with db.session_context() as session:
+        repo = OrderRepository(session)
+        await repo.update_order_fill("orphan-oid", Decimal("0"), Decimal("0"), exchange_order_id="9001")
+        await repo.update_order_fill("exit-oid", Decimal("0"), Decimal("0"), exchange_order_id="9002")
+
+    class _FreshConnector(_Connector):
+        def __init__(self):
+            super().__init__()
+            self.direct = []
+            self.open_orders = [
+                {"externalOid": "orphan-oid", "orderId": "9001"},
+                {"externalOid": "exit-oid", "orderId": "9002"},
+            ]
+
+        async def cancel(self, trading_pair=None, client_order_id=None):
+            # The fresh tracker does not know these ids, so this call is a no-op.
+            self.cancels.append((trading_pair, client_order_id))
+
+        async def _place_cancel(self, order_id, tracked):
+            self.direct.append((order_id, tracked.exchange_order_id))
+            self.open_orders = [
+                row for row in self.open_orders
+                if row.get("externalOid") != order_id
+                and str(row.get("orderId")) != str(tracked.exchange_order_id)
+            ]
+            return True
+
+        async def list_open_orders(self, trading_pair=None):
+            return list(self.open_orders)
+
+    connector = _FreshConnector()
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    assert connector.cancels == []
+    assert ("orphan-oid", "9001") in connector.direct
+    assert ("exit-oid", "9002") in connector.direct
+    assert connector.open_orders == []
+    assert "Cancelled open child order orphan-oid" in caplog.text
+    assert "Cancelled open child order exit-oid" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_stop_cancel_is_logged_as_a_failure(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "bad-stop",
+        {
+            "exit_state": "DONE",
+            "exchange_stop_order_id": "stop-bad",
+            "open_base": "1",
+            "side": "BUY",
+        },
+    )
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            "bad-stop", status="TERMINATED", close_type="FAILED"
+        )
+    connector = _Connector()
+    connector.stop_result = {"success": False, "code": 500, "message": "rejected"}
+    connector.in_flight_orders["stop-bad"] = _open_order()
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    assert connector.stop_cancels == ["stop-bad"]
+    assert connector.cancels == []
+    assert "Failed to cancel exchange stop stop-bad" in caplog.text
+    assert "Cancelled exchange stop stop-bad" not in caplog.text
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "bad-stop")
+    stored = json.loads(row.final_state)
+    assert "rejected" in stored["exchange_stop_error"]
+    assert stored.get("exchange_stop_cancelled") is not True
+
+
+@pytest.mark.asyncio
+async def test_search_exposes_resume_and_stop_errors(db):
+    await _seed_iceberg_row(
+        db,
+        "shown-1",
+        {
+            "resume_failed": True,
+            "resume_error": "could not read the exchange position",
+            "exchange_stop_error": "stop still open",
+            "exit_state": "RESTING",
+        },
+    )
+    service = _service(db)
+    rows = await service.get_executors()
+    shown = next(row for row in rows if row["executor_id"] == "shown-1")
+    assert shown["resume_failed"] is True
+    assert shown["resume_error"] == "could not read the exchange position"
+    assert shown["exchange_stop_error"] == "stop still open"

@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type
 
 from fastapi import HTTPException
@@ -284,30 +285,146 @@ def _average_entry_price(executor: Any, custom_info: Any) -> Optional[Decimal]:
     return None
 
 
-def _exit_only_custom_info(custom: Dict[str, Any], open_base: Decimal) -> Dict[str, Any]:
-    """Restore payload that continues exits only.
+def _entry_average_from_saved(custom: Dict[str, Any]) -> Optional[Decimal]:
+    """Average price of the entry fills, ignoring exit fills.
 
-    A resumed range iceberg does not continue an unfinished entry. Old entry
-    and exit client order ids are dropped here so restore does not adopt them.
-    Startup still cancels those ids from the saved row. ``open_base`` is the
-    position the exit is allowed to close.
+    A partial take profit stores its own quote on the exit. Dividing that
+    quote by the remaining base is not the entry average.
     """
-    saved = {key: value for key, value in custom.items() if key not in _API_RESUME_KEYS}
+    filled = _reported_decimal(None, custom, "filled_base")
+    if filled is None or filled <= 0:
+        filled = _reported_decimal(None, custom, "filled_amount_base")
+    quote = _reported_decimal(None, custom, "filled_quote")
+    if quote is None or quote <= 0:
+        quote = _reported_decimal(None, custom, "filled_amount_quote")
+    exit_blob = custom.get("exit") if isinstance(custom.get("exit"), dict) else {}
+    if (filled is None or filled <= 0) and exit_blob:
+        filled = _reported_decimal(None, exit_blob, "entry_filled_base")
+    if (quote is None or quote <= 0) and exit_blob:
+        quote = _reported_decimal(None, exit_blob, "entry_filled_quote")
+    if filled is not None and filled > 0 and quote is not None and quote > 0:
+        return quote / filled
+    for key in ("average_fill_price", "average_entry_price"):
+        price = _reported_decimal(None, custom, key)
+        if price is not None and price > 0:
+            return price
+    return None
+
+
+def _prices_are_consistent(left: Decimal, right: Decimal) -> bool:
+    scale = max(abs(left), abs(right))
+    if scale <= 0:
+        return False
+    return abs(left - right) / scale <= Decimal("0.01")
+
+
+def _resume_entry_average(
+    custom: Dict[str, Any],
+    exchange_entry_price: Optional[Decimal],
+) -> Optional[Decimal]:
+    """Entry average for the restored position.
+
+    Prefer the saved entry fills. Use the exchange position's entry price when
+    it is the only price we have, or when it agrees with those fills. A price
+    that disagrees is another position on the same side, so the saved fills win.
+    """
+    saved = _entry_average_from_saved(custom)
+    exchange = exchange_entry_price if exchange_entry_price is not None and exchange_entry_price > 0 else None
+    if saved is not None and exchange is not None and not _prices_are_consistent(saved, exchange):
+        logger.warning(
+            "Exchange entry price %s does not match saved entry average %s. "
+            "Resuming on the saved entry average.",
+            exchange,
+            saved,
+        )
+        return saved
+    if saved is not None:
+        return saved
+    return exchange
+
+
+def _exit_phase_for_state(exit_state: Any) -> str:
+    name = str(exit_state or "").strip().upper()
+    return {
+        "ARMED": "armed",
+        "RESTING": "resting",
+        "TRIGGERED": "cancelling_entry",
+        "CLOSING": "executing",
+        "DONE": "done",
+    }.get(name, "armed")
+
+
+def _exit_only_custom_info(
+    custom: Dict[str, Any],
+    open_base: Decimal,
+    average: Optional[Decimal],
+) -> Dict[str, Any]:
+    """Clean restore payload that continues exits only.
+
+    A resumed range iceberg does not continue an unfinished entry. The payload
+    is not a copy of the saved custom_info: a partial take profit's
+    filled_by_order and exit quote would make the remaining base look like it
+    was entered at the wrong price, and the stop would fire at once.
+
+    ``size_unit`` is BASE. ``open_base`` is the position the exit may close.
+    Entry quote is that base times the entry average. Startup still cancels
+    the old client order ids from the saved row.
+    """
     amount = format(open_base, "f")
-    saved[_RESUME_ENTRIES] = False
-    saved["open_base"] = amount
-    saved["filled_base"] = amount
-    saved["closed_base"] = "0"
-    saved["exit_order_ids"] = []
-    saved["child_order_ids"] = []
-    exit_blob = saved.get("exit")
-    if isinstance(exit_blob, dict):
-        exit_blob = dict(exit_blob)
-        exit_blob["order_ids"] = []
-        exit_blob["entry_filled_base"] = amount
-        exit_blob["filled_base"] = "0"
-        saved["exit"] = exit_blob
-    return saved
+    quote = "0" if average is None or average <= 0 else format(open_base * average, "f")
+    average_text = None if average is None or average <= 0 else format(average, "f")
+    exit_blob = custom.get("exit") if isinstance(custom.get("exit"), dict) else {}
+    exit_state = custom.get("exit_state") or exit_blob.get("exit_state")
+    active = custom.get("exit_active") or exit_blob.get("active")
+    payload: Dict[str, Any] = {
+        _RESUME_ENTRIES: False,
+        "size_unit": "BASE",
+        "side": custom.get("side"),
+        "mode": custom.get("mode"),
+        "exit_state": exit_state,
+        "exit_active": active,
+        "open_base": amount,
+        "filled_base": amount,
+        "closed_base": "0",
+        "filled_quote": quote,
+        "average_fill_price": average_text,
+        "exchange_stop_order_id": custom.get("exchange_stop_order_id"),
+        "child_order_ids": [],
+        "exit_order_ids": [],
+    }
+    if "schedule_clock" in custom:
+        payload["schedule_clock"] = custom.get("schedule_clock")
+    if "schedule_started_at" in custom:
+        payload["schedule_started_at"] = custom.get("schedule_started_at")
+    payload["exit"] = {
+        "active": active,
+        "status": _exit_phase_for_state(exit_state),
+        "exit_state": exit_state,
+        "exchange_stop_order_id": custom.get("exchange_stop_order_id"),
+        "trigger_price": exit_blob.get("trigger_price"),
+        "entry_filled_base": amount,
+        "entry_filled_quote": quote,
+        "filled_base": "0",
+        "filled_quote": "0",
+        "average_price": average_text,
+        "order_ids": [],
+        "filled_by_order": {},
+        "started_at": exit_blob.get("started_at"),
+        "paused_seconds": exit_blob.get("paused_seconds") or 0,
+    }
+    return payload
+
+
+def _resume_search_fields(custom_info: Any) -> Dict[str, Any]:
+    """Fields Condor reads from an executor search row."""
+    info = custom_info if isinstance(custom_info, dict) else {}
+    error = info.get("exchange_stop_error")
+    resume_error = info.get(_RESUME_ERROR)
+    return {
+        "resume_failed": bool(info.get(_RESUME_FAILED)),
+        "resume_error": None if resume_error in (None, "") else str(resume_error),
+        "exchange_stop_error": None if error in (None, "") else str(error),
+    }
 
 
 def _live_order_ids_from_custom(custom_info: Any) -> List[str]:
@@ -944,12 +1061,15 @@ class ExecutorService:
         config = dict(config)
         config["type"] = "range_iceberg_executor"
         config["id"] = executor_id
-        # A resumed executor does not continue an unfinished entry. total_amount
-        # is the reconciled open base, so the new process treats the entry as
-        # finished and only works the exit. See _exit_only_custom_info.
+        # A resumed executor does not continue an unfinished entry. size_unit
+        # is forced to BASE. A QUOTE total_amount equal to the open base would
+        # be read as quote and place a much larger new entry. resume_entries
+        # false is the same instruction on the config the executor reads.
         open_base = _reported_decimal(None, custom, "open_base")
         if open_base is not None:
             config["total_amount"] = format(open_base, "f")
+            config["size_unit"] = "BASE"
+            config[_RESUME_ENTRIES] = False
         config.setdefault("controller_id", item["controller_id"])
         if item.get("connector_name"):
             config.setdefault("connector_name", item["connector_name"])
@@ -1029,12 +1149,13 @@ class ExecutorService:
         connector_name: str,
         trading_pair: str,
         side_name: str,
-    ) -> Optional[Decimal]:
-        """Absolute base on this pair and side.
+    ) -> Optional[tuple]:
+        """Absolute base and entry price on this pair and side.
 
-        None when the connector position book cannot be read. Zero when the
-        book was read and that side is flat. Hedge mode matches LONG to BUY
-        and SHORT to SELL. A signed one-way amount uses its sign the same way.
+        None when the connector position book cannot be read. The base is zero
+        when the book was read and that side is flat. The entry price is None
+        when the book has no price. Hedge mode matches LONG to BUY and SHORT
+        to SELL. A signed one-way amount uses its sign the same way.
         """
         connector = self._account_connector(account_name, connector_name)
         if connector is None or not hasattr(connector, "account_positions"):
@@ -1058,6 +1179,8 @@ class ExecutorService:
             return None
         want_long = side_name in {"BUY", "LONG"}
         total = Decimal("0")
+        entry_base = Decimal("0")
+        entry_notional = Decimal("0")
         for position in book.values():
             pair = position.get("trading_pair") if isinstance(position, dict) else getattr(position, "trading_pair", None)
             if pair != trading_pair:
@@ -1066,6 +1189,7 @@ class ExecutorService:
             side_text = getattr(raw_side, "name", raw_side)
             side_text = side_text.strip().upper() if isinstance(side_text, str) else ""
             raw_amount = position.get("amount") if isinstance(position, dict) else getattr(position, "amount", 0)
+            raw_entry = position.get("entry_price") if isinstance(position, dict) else getattr(position, "entry_price", None)
             try:
                 amount = Decimal(str(raw_amount or 0))
             except Exception:
@@ -1076,9 +1200,19 @@ class ExecutorService:
                 matches = False
             else:
                 matches = (amount > 0) == want_long
-            if matches:
-                total += abs(amount)
-        return total
+            if not matches:
+                continue
+            base = abs(amount)
+            total += base
+            try:
+                entry_price = Decimal(str(raw_entry)) if raw_entry not in (None, "") else None
+            except Exception:
+                entry_price = None
+            if entry_price is not None and entry_price > 0 and base > 0:
+                entry_base += base
+                entry_notional += entry_price * base
+        average_entry = entry_notional / entry_base if entry_base > 0 else None
+        return total, average_entry
 
     async def _mark_closed_while_down(self, item: Dict[str, Any]) -> None:
         """The exchange position is flat, so this parked executor is not resumed."""
@@ -1127,22 +1261,30 @@ class ExecutorService:
         executor_id: str,
         stop_id: Optional[str],
         reason: str,
-    ) -> bool:
+    ) -> Optional[str]:
+        """Cancel one exchange stop. None when it is confirmed, otherwise the error.
+
+        ``connector.cancel`` does not cancel a MEXC stop id. The stop cancel
+        API is ``cancel_stop_orders``. A response that does not accept the id,
+        or an open-stop query that still lists it, is a failure.
+        """
         if not stop_id:
-            return True
+            return None
         connector = self._account_connector(account_name, connector_name)
         try:
-            await self._cancel_on_connector(connector, trading_pair, stop_id)
+            error = await self._cancel_stop_on_connector(connector, trading_pair, stop_id)
         except Exception as exc:
+            error = str(exc)
+        if error:
             logger.error(
                 "Failed to cancel exchange stop %s for executor %s on %s %s: %s",
                 stop_id,
                 executor_id,
                 connector_name,
                 trading_pair,
-                exc,
+                error,
             )
-            return False
+            return error
         logger.info(
             "Cancelled exchange stop %s for executor %s on %s %s because %s",
             stop_id,
@@ -1151,7 +1293,148 @@ class ExecutorService:
             trading_pair,
             reason,
         )
-        return True
+        return None
+
+    async def _park_flat(self, item: Dict[str, Any], reason: str) -> None:
+        """Leave the row RUNNING so software orders are still cancelled, then close it."""
+        flats = getattr(self, "_flat_while_down", None)
+        if flats is None:
+            flats = []
+            self._flat_while_down = flats
+        flats.append(item)
+        stop_id = _exchange_stop_id(item.get("custom"))
+        error = await self._cancel_exchange_stop_now(
+            item.get("account_name") or self.default_account,
+            item.get("connector_name") or "",
+            item.get("trading_pair") or "",
+            item["executor_id"],
+            stop_id,
+            reason,
+        )
+        if error:
+            custom = item.get("custom")
+            if isinstance(custom, dict):
+                custom["exchange_stop_error"] = error
+        logger.info(
+            "Range iceberg executor %s was not resumed on %s %s. %s Cancelled exchange stop %s.",
+            item["executor_id"],
+            item.get("connector_name"),
+            item.get("trading_pair"),
+            reason,
+            stop_id or "none",
+        )
+
+    async def _resume_allocated_positions(
+        self,
+        ready: List[Dict[str, Any]],
+        protected: set,
+        resumed: List[str],
+    ) -> None:
+        """Give each parked executor a share of the one exchange position.
+
+        Executors on the same account, connector, pair, and side share one
+        position. Shares are handed out in created_at order. Each share is at
+        most that executor's saved open base, and the shares sum to at most
+        the exchange position. A later executor that is left with nothing is
+        closed instead of resumed.
+        """
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for item in ready:
+            key = (
+                item.get("account_name") or self.default_account,
+                item.get("connector_name") or "",
+                item.get("trading_pair") or "",
+                item.get("_side_name") or "BUY",
+            )
+            groups.setdefault(key, []).append(item)
+        for key, items in groups.items():
+            items.sort(key=lambda row: (row.get("created_at") is None, row.get("created_at"), row["executor_id"]))
+            actual = items[0].get("_actual") or Decimal("0")
+            if actual == 0:
+                for item in items:
+                    await self._park_flat(item, "the position was flat while the API was down")
+                continue
+            remaining = actual
+            shares: List[str] = []
+            for item in items:
+                saved_open = item.get("_saved_open")
+                if saved_open is None:
+                    share = remaining
+                else:
+                    share = min(saved_open, remaining)
+                if share <= 0:
+                    await self._park_flat(
+                        item,
+                        "no exchange position remained after earlier executors on this side were allocated",
+                    )
+                    shares.append(f"{item['executor_id']}=0")
+                    continue
+                remaining -= share
+                if saved_open is not None and share < saved_open:
+                    logger.info(
+                        "Allocated %s of exchange position %s to range iceberg %s "
+                        "(saved open_base %s) on %s %s. Later executors share what remains.",
+                        share,
+                        actual,
+                        item["executor_id"],
+                        saved_open,
+                        key[2],
+                        key[3],
+                    )
+                elif saved_open is not None and actual > saved_open and len(items) == 1:
+                    logger.warning(
+                        "Exchange position %s is larger than saved open_base %s for range iceberg %s "
+                        "on %s. Another position may share this side. Resuming exits on %s.",
+                        actual,
+                        saved_open,
+                        item["executor_id"],
+                        key[2],
+                        share,
+                    )
+                shares.append(f"{item['executor_id']}={format(share, 'f')}")
+                custom = item["custom"]
+                average = _resume_entry_average(custom, item.get("_entry_price"))
+                attempt = dict(item)
+                attempt["custom"] = _exit_only_custom_info(custom, share, average)
+                state = item.get("_state")
+                stop_id = _exchange_stop_id(custom)
+                try:
+                    live_ids = await self._resume_one_range_iceberg(attempt)
+                except Exception as exc:
+                    await self._mark_resume_failed(item, str(exc))
+                    if stop_id:
+                        protected.add(stop_id)
+                    logger.error(
+                        "Failed to resume range iceberg executor %s (exit_state=%s). "
+                        "Left exchange stop %s on the exchange. %s",
+                        item["executor_id"],
+                        state,
+                        stop_id or "none",
+                        exc,
+                    )
+                    continue
+                protected.update(live_ids)
+                self._resumed_executor_ids.add(item["executor_id"])
+                resumed.append(item["executor_id"])
+                logger.info(
+                    "Resumed range iceberg executor %s from saved state (exit_state=%s) "
+                    "before orphan cleanup. Resuming exits only on open_base %s. "
+                    "Protected exchange stop %s. Software order ids stay eligible for cleanup.",
+                    item["executor_id"],
+                    state,
+                    format(share, "f"),
+                    stop_id or "none",
+                )
+            if len(items) > 1:
+                logger.info(
+                    "Allocated exchange position %s on %s %s across parked executors: %s. "
+                    "The shares sum to %s, which does not exceed the position.",
+                    actual,
+                    key[2],
+                    key[3],
+                    ", ".join(shares),
+                    format(actual - remaining, "f"),
+                )
 
     async def _resume_range_iceberg_executors(self) -> None:
         """Start range icebergs that graceful shutdown saved, before orphan cleanup.
@@ -1170,6 +1453,7 @@ class ExecutorService:
             return
         candidates = await self._load_resume_candidates()
         resumed: List[str] = []
+        ready: List[Dict[str, Any]] = []
         for item in candidates:
             executor_id = item["executor_id"]
             custom = item["custom"]
@@ -1192,21 +1476,21 @@ class ExecutorService:
                 continue
             side_name = self._saved_side_name(item)
             try:
-                actual = await self._exchange_open_base(
+                snapshot = await self._exchange_open_base(
                     item.get("account_name") or self.default_account,
                     item.get("connector_name") or "",
                     item.get("trading_pair") or "",
                     side_name,
                 )
             except Exception as exc:
-                actual = None
+                snapshot = None
                 logger.error(
                     "Could not read the exchange position for range iceberg %s: %s",
                     executor_id,
                     exc,
                     exc_info=True,
                 )
-            if actual is None:
+            if snapshot is None:
                 await self._mark_resume_failed(
                     item,
                     "could not read the exchange position before resume",
@@ -1221,87 +1505,14 @@ class ExecutorService:
                     stop_id or "none",
                 )
                 continue
-            saved_open = range_iceberg_held_base(None, custom)
-            if actual == 0:
-                # Leave the row RUNNING so the cleanup pass still cancels its
-                # software orders. The close type is written after that pass.
-                flats = getattr(self, "_flat_while_down", None)
-                if flats is None:
-                    flats = []
-                    self._flat_while_down = flats
-                flats.append(item)
-                await self._cancel_exchange_stop_now(
-                    item.get("account_name") or self.default_account,
-                    item.get("connector_name") or "",
-                    item.get("trading_pair") or "",
-                    executor_id,
-                    stop_id,
-                    "the position was flat while the API was down",
-                )
-                logger.info(
-                    "Range iceberg executor %s was flat on %s %s while the API was down. "
-                    "Did not resume. Cancelled exchange stop %s.",
-                    executor_id,
-                    item.get("connector_name"),
-                    item.get("trading_pair"),
-                    stop_id or "none",
-                )
-                continue
-            if saved_open is None:
-                resume_base = actual
-            elif actual < saved_open:
-                resume_base = actual
-                logger.info(
-                    "Exchange position %s is smaller than saved open_base %s for range iceberg %s "
-                    "on %s. Resuming exits on %s.",
-                    actual,
-                    saved_open,
-                    executor_id,
-                    item.get("trading_pair"),
-                    resume_base,
-                )
-            elif actual > saved_open:
-                resume_base = saved_open
-                logger.warning(
-                    "Exchange position %s is larger than saved open_base %s for range iceberg %s "
-                    "on %s. Another position may share this side. Resuming exits on %s.",
-                    actual,
-                    saved_open,
-                    executor_id,
-                    item.get("trading_pair"),
-                    resume_base,
-                )
-            else:
-                resume_base = saved_open
-            attempt = dict(item)
-            attempt["custom"] = _exit_only_custom_info(custom, resume_base)
-            try:
-                live_ids = await self._resume_one_range_iceberg(attempt)
-            except Exception as exc:
-                await self._mark_resume_failed(item, str(exc))
-                if stop_id:
-                    protected.add(stop_id)
-                logger.error(
-                    "Failed to resume range iceberg executor %s (exit_state=%s). "
-                    "Left exchange stop %s on the exchange. %s",
-                    executor_id,
-                    state,
-                    stop_id or "none",
-                    exc,
-                )
-                continue
-            protected.update(live_ids)
-            self._resumed_executor_ids.add(executor_id)
-            resumed.append(executor_id)
-            logger.info(
-                "Resumed range iceberg executor %s from saved state (exit_state=%s) "
-                "before orphan cleanup. Resuming exits only on open_base %s. "
-                "Protected exchange stop %s. Software order ids stay eligible for cleanup.",
-                executor_id,
-                state,
-                format(resume_base, "f"),
-                stop_id or "none",
-            )
+            actual, entry_price = snapshot
+            item["_saved_open"] = range_iceberg_held_base(None, custom)
+            item["_actual"] = actual
+            item["_entry_price"] = entry_price
+            item["_state"] = state
+            item["_side_name"] = side_name
+            ready.append(item)
+        await self._resume_allocated_positions(ready, protected, resumed)
         if resumed:
             logger.info(
                 "Resumed range iceberg executors before orphan cleanup: %s",
@@ -1565,17 +1776,20 @@ class ExecutorService:
                 stop_id = _exchange_stop_id(custom)
                 resumed = record.executor_id in resumed_ids
                 cancel_stop = bool(stop_id) and not resumed and _open_base_is_zero(custom)
-                if stop_id and cancel_stop and stop_id not in seen:
-                    seen.add(stop_id)
-                    order_ids.append(stop_id)
-                elif stop_id:
+                if stop_id:
                     order_ids = [oid for oid in order_ids if oid != stop_id]
                 if protected:
                     order_ids = [oid for oid in order_ids if oid not in protected]
-                if not order_ids:
+                stop_to_cancel = stop_id if cancel_stop and stop_id not in protected else None
+                if not order_ids and not stop_to_cancel:
                     continue
                 db_orders = await order_repo.get_orders_by_client_ids(order_ids)
                 db_status = {row.client_order_id: row.status for row in db_orders}
+                exchange_ids = {
+                    row.client_order_id: row.exchange_order_id
+                    for row in db_orders
+                    if row.exchange_order_id
+                }
                 pending.append({
                     "executor_id": record.executor_id,
                     "account_name": record.account_name,
@@ -1584,7 +1798,8 @@ class ExecutorService:
                     "order_ids": order_ids,
                     "filled_ids": set(filled),
                     "db_status": db_status,
-                    "stop_id": stop_id if cancel_stop and stop_id not in protected else None,
+                    "exchange_ids": exchange_ids,
+                    "stop_id": stop_to_cancel,
                 })
 
         for item in pending:
@@ -1592,13 +1807,27 @@ class ExecutorService:
             book = getattr(connector, "in_flight_orders", None) if connector is not None else None
             if not isinstance(book, dict):
                 book = {}
+            if item.get("stop_id"):
+                await self._cancel_exchange_stop_now(
+                    item["account_name"],
+                    item["connector_name"],
+                    item["trading_pair"],
+                    item["executor_id"],
+                    item["stop_id"],
+                    "open_base is 0",
+                )
             for order_id in item["order_ids"]:
                 if order_id in item["filled_ids"]:
                     continue
                 if not self._child_order_still_open(order_id, book, item["db_status"].get(order_id)):
                     continue
                 try:
-                    await self._cancel_on_connector(connector, item["trading_pair"], order_id)
+                    await self._cancel_software_order(
+                        connector,
+                        item["trading_pair"],
+                        order_id,
+                        (item.get("exchange_ids") or {}).get(order_id),
+                    )
                 except Exception as e:
                     logger.error(
                         "Failed to cancel open child order %s for executor %s on %s %s: %s",
@@ -1609,22 +1838,13 @@ class ExecutorService:
                         e,
                     )
                     continue
-                if item.get("stop_id") and order_id == item["stop_id"]:
-                    logger.info(
-                        "Cancelled exchange stop %s for executor %s on %s %s because open_base is 0",
-                        order_id,
-                        item["executor_id"],
-                        item["connector_name"],
-                        item["trading_pair"],
-                    )
-                else:
-                    logger.info(
-                        "Cancelled open child order %s for executor %s on %s %s before SYSTEM_CLEANUP",
-                        order_id,
-                        item["executor_id"],
-                        item["connector_name"],
-                        item["trading_pair"],
-                    )
+                logger.info(
+                    "Cancelled open child order %s for executor %s on %s %s before SYSTEM_CLEANUP",
+                    order_id,
+                    item["executor_id"],
+                    item["connector_name"],
+                    item["trading_pair"],
+                )
 
     async def _cancel_finished_exchange_stops(self, protected_order_ids: Optional[set] = None) -> None:
         """Cancel exchange stops left by executors that already ended.
@@ -1663,7 +1883,7 @@ class ExecutorService:
                     "custom": custom,
                 })
         for item in pending:
-            cancelled = await self._cancel_exchange_stop_now(
+            error = await self._cancel_exchange_stop_now(
                 item["account_name"],
                 item["connector_name"],
                 item["trading_pair"],
@@ -1671,11 +1891,13 @@ class ExecutorService:
                 item["stop_id"],
                 "the executor is not RUNNING and was not parked for resume",
             )
-            if not cancelled:
-                continue
             custom = dict(item["custom"])
-            custom[_EXCHANGE_STOP_CANCELLED] = True
             custom[_RESUME_ON_STARTUP] = False
+            if error:
+                custom["exchange_stop_error"] = error
+            else:
+                custom[_EXCHANGE_STOP_CANCELLED] = True
+                custom.pop("exchange_stop_error", None)
             try:
                 encoded = json.dumps(custom, default=_json_default)
             except Exception:
@@ -1699,6 +1921,198 @@ class ExecutorService:
         if inflight is not None:
             return _inflight_is_open(inflight)
         return _order_status_is_open(db_status)
+
+    @staticmethod
+    def _software_order_is_tracked(connector: Any, order_id: str) -> bool:
+        book = getattr(connector, "in_flight_orders", None)
+        if isinstance(book, dict) and order_id in book:
+            return True
+        finder = getattr(connector, "_find_order", None)
+        if callable(finder):
+            try:
+                return finder(order_id) is not None
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def _open_row_matches(row: Any, client_order_id: str, exchange_order_id: Optional[str]) -> bool:
+        if isinstance(row, str):
+            return row == client_order_id or (exchange_order_id is not None and row == exchange_order_id)
+        if isinstance(row, dict):
+            client = row.get("externalOid") or row.get("client_order_id") or row.get("clientOrderId")
+            exchange = row.get("orderId") or row.get("exchange_order_id") or row.get("id")
+        else:
+            client = getattr(row, "client_order_id", None) or getattr(row, "externalOid", None)
+            exchange = getattr(row, "exchange_order_id", None) or getattr(row, "orderId", None)
+        if client is not None and str(client) == client_order_id:
+            return True
+        return exchange_order_id is not None and exchange is not None and str(exchange) == str(exchange_order_id)
+
+    async def _open_orders(self, connector: Any, trading_pair: str) -> Optional[list]:
+        """Open orders from the connector, or None when it has no query."""
+        lister = getattr(connector, "list_open_orders", None)
+        if callable(lister):
+            try:
+                result = lister(trading_pair)
+            except TypeError:
+                result = lister()
+        else:
+            lister = getattr(connector, "_open_order_rows", None)
+            if not callable(lister):
+                return None
+            result = lister()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result is None:
+            return []
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            data = result.get("data", result)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("resultList", "list", "orders"):
+                    rows = data.get(key)
+                    if isinstance(rows, list):
+                        return rows
+        return []
+
+    async def _cancel_untracked_software_order(
+        self,
+        connector: Any,
+        trading_pair: str,
+        client_order_id: str,
+        exchange_order_id: Optional[str],
+    ) -> None:
+        """Cancel an order the fresh tracker does not know.
+
+        ``connector.cancel`` returns without calling the exchange when the
+        order was never tracked by this process. Cancel by exchange order id
+        through ``_place_cancel`` (or ``cancel_order_by_exchange_id``).
+        """
+        placer = getattr(connector, "_place_cancel", None)
+        if callable(placer):
+            target = SimpleNamespace(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+            )
+            result = placer(client_order_id, target)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is False:
+                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
+            return
+        named = getattr(connector, "cancel_order_by_exchange_id", None)
+        if callable(named) and exchange_order_id:
+            result = named(exchange_order_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is False:
+                raise RuntimeError(f"direct cancel of exchange order {exchange_order_id} was rejected")
+            return
+        raise RuntimeError(f"no direct cancel for untracked order {client_order_id}")
+
+    async def _cancel_software_order(
+        self,
+        connector: Any,
+        trading_pair: str,
+        client_order_id: str,
+        exchange_order_id: Optional[str],
+    ) -> None:
+        """Cancel one software order and confirm it is no longer open.
+
+        A tracked order uses ``connector.cancel``. An untracked order uses the
+        direct cancel path. When the connector can list open orders, success
+        requires that the id is gone from that list.
+        """
+        tracked = connector is not None and self._software_order_is_tracked(connector, client_order_id)
+        if tracked:
+            await self._cancel_on_connector(connector, trading_pair, client_order_id)
+        else:
+            try:
+                await self._cancel_untracked_software_order(
+                    connector, trading_pair, client_order_id, exchange_order_id
+                )
+            except RuntimeError as exc:
+                if not str(exc).startswith("no direct cancel"):
+                    raise
+                # No direct path on this connector. The plain cancel is the
+                # only call it exposes. An open-order query below rejects it
+                # when that call left the order working.
+                await self._cancel_on_connector(connector, trading_pair, client_order_id)
+        open_rows = await self._open_orders(connector, trading_pair)
+        if open_rows is None:
+            return
+        if any(self._open_row_matches(row, client_order_id, exchange_order_id) for row in open_rows):
+            raise RuntimeError(
+                f"order {client_order_id} is still open after cancel"
+            )
+
+    @staticmethod
+    def _stop_cancel_error(result: Any, stop_id: str) -> Optional[str]:
+        """None when the stop-cancel response accepted the id."""
+        if result is None:
+            return f"cancel_stop_orders returned nothing for {stop_id}"
+        data: Any = result
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                detail = result.get("message") or result.get("msg") or result
+                return f"cancel_stop_orders rejected {stop_id}: {detail}"
+            code = result.get("code")
+            if code not in (None, 0, "0"):
+                return f"cancel_stop_orders code {code} for {stop_id}"
+            data = result.get("data", [])
+        rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("errorCode", row.get("error_code", 0))
+            try:
+                code = int(raw or 0)
+            except (TypeError, ValueError):
+                code = 1
+            if code != 0:
+                detail = row.get("errorMsg") or row
+                return f"cancel_stop_orders error {code} for {stop_id}: {detail}"
+        return None
+
+    async def _cancel_stop_on_connector(
+        self,
+        connector: Any,
+        trading_pair: str,
+        stop_id: str,
+    ) -> Optional[str]:
+        """None when the exchange accepted the stop cancel and the id is gone."""
+        if connector is None:
+            return f"connector is not loaded; cannot cancel stop {stop_id}"
+        canceller = getattr(connector, "cancel_stop_orders", None)
+        if not callable(canceller):
+            return f"connector has no cancel_stop_orders; cannot cancel stop {stop_id}"
+        try:
+            result = canceller([stop_id])
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as exc:
+            return str(exc)
+        error = self._stop_cancel_error(result, stop_id)
+        if error:
+            return error
+        lister = getattr(connector, "list_open_stop_orders", None)
+        if not callable(lister):
+            return None
+        try:
+            listed = lister(trading_pair)
+            if asyncio.iscoroutine(listed):
+                listed = await listed
+        except Exception as exc:
+            return f"could not confirm stop {stop_id} was cancelled: {exc}"
+        rows = listed if isinstance(listed, list) else []
+        if any(self._open_row_matches(row, stop_id, stop_id) for row in rows):
+            return f"stop {stop_id} is still open after cancel_stop_orders"
+        return None
 
     @staticmethod
     async def _cancel_on_connector(connector: Any, trading_pair: str, order_id: str) -> None:
@@ -2780,6 +3194,7 @@ class ExecutorService:
         # Add log capture info
         result["error_count"] = self._log_capture.get_error_count(executor_id)
         result["last_error"] = self._log_capture.get_last_error(executor_id)
+        result.update(_resume_search_fields(result.get("custom_info")))
 
         return result
 
@@ -2833,6 +3248,9 @@ class ExecutorService:
             ) if record.final_state else None,
             "error_count": error_count,
             "last_error": last_error,
+            **_resume_search_fields(
+                json.loads(record.final_state) if record.final_state else None
+            ),
         }
 
     def get_summary(self) -> Dict[str, Any]:
