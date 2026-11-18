@@ -33,6 +33,7 @@ from database.repositories.executor_repository import ExecutorRepository
 from database.repositories.order_repository import OrderRepository
 from services.executor_service import (
     ExecutorService,
+    _exchange_stop_ids,
     child_order_ids_from_custom_info,
     range_iceberg_held_base,
 )
@@ -1681,3 +1682,230 @@ async def test_search_exposes_resume_and_stop_errors(db):
     assert shown["resume_failed"] is True
     assert shown["resume_error"] == "could not read the exchange position"
     assert shown["exchange_stop_error"] == "stop still open"
+
+
+def test_exchange_stop_ids_fall_back_to_the_primary():
+    assert _exchange_stop_ids({"exchange_stop_order_id": "stop-1"}) == ["stop-1"]
+    assert _exchange_stop_ids({"exchange_stop_order_ids": ["stop-2", "stop-3"]}) == ["stop-2", "stop-3"]
+    assert _exchange_stop_ids({
+        "exchange_stop_order_id": "stop-1",
+        "exchange_stop_order_ids": ["stop-2", "stop-1"],
+    }) == ["stop-2", "stop-1"]
+    assert _exchange_stop_ids({
+        "exchange_stop_order_id": "stop-1",
+        "exchange_stop_order_ids": ["stop-2"],
+    }) == ["stop-2", "stop-1"]
+    assert _exchange_stop_ids({}) == []
+
+
+@pytest.mark.asyncio
+async def test_resume_re_adopts_every_exchange_stop_id(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "stops-1",
+        {
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "side": "BUY",
+            "child_order_ids": ["entry-list"],
+            "exchange_stop_order_id": "stop-a",
+            "exchange_stop_order_ids": ["stop-b", "stop-a"],
+            "open_base": "1.5",
+            "filled_base": "1.5",
+            "filled_quote": "1.5",
+        },
+    )
+    connector = _Connector()
+    connector.account_positions = _long_position("1.5")
+    for order_id in ("entry-list", "stop-a", "stop-b"):
+        connector.in_flight_orders[order_id] = _open_order()
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    resumed = service._active_executors["stops-1"]
+    assert resumed.restored["exchange_stop_order_id"] == "stop-a"
+    assert resumed.restored["exchange_stop_order_ids"] == ["stop-b", "stop-a"]
+    assert resumed.restored["exit"]["exchange_stop_order_ids"] == ["stop-b", "stop-a"]
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "entry-list" in cancelled
+    assert "stop-a" not in cancelled
+    assert "stop-b" not in cancelled
+    assert connector.stop_cancels == []
+    assert "Protected exchange stop stop-b, stop-a" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_persists_every_exchange_stop_id(db, caplog):
+    events = []
+    connector = _Connector(confirmed=True)
+    info = _iceberg_custom("RESTING", exchange_stop_order_ids=["stop-1", "stop-2"])
+    executor = _CancellingExecutor(events, custom_info=info, unconfirmed=[])
+    executor.connectors = {"mexc_perpetual": connector}
+    connector.in_flight_orders["stop-1"] = _open_order()
+    connector.in_flight_orders["stop-2"] = _open_order()
+    await _seed_executor(db, "park-stops", "master", "mexc_perpetual", "BTC-USDT", None, [])
+    service = _service(db)
+    service.SHUTDOWN_CANCEL_TIMEOUT_SECONDS = 0
+    service._trading_interfaces["master"] = _Interface(events)
+    service._active_executors["park-stops"] = executor
+    service._executor_metadata["park-stops"] = {
+        "connector_name": "mexc_perpetual",
+        "trading_pair": "BTC-USDT",
+        "account_name": "master",
+        "executor_type": "range_iceberg_executor",
+    }
+    _track_completion(service, events)
+    with caplog.at_level(logging.INFO):
+        await service.stop()
+    stored = json.loads(next(row.final_state for row in db.query(ExecutorRecord) if row.executor_id == "park-stops"))
+    assert stored["resume_on_startup"] is True
+    assert stored["exchange_stop_order_id"] == "stop-1"
+    assert stored["exchange_stop_order_ids"] == ["stop-1", "stop-2"]
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "stop-1" not in cancelled
+    assert "stop-2" not in cancelled
+    assert connector.stop_cancels == []
+    assert "stop-1, stop-2" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancels_every_exchange_stop_id(db, caplog):
+    await _seed_iceberg_row(
+        db,
+        "flat-list",
+        {
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "side": "BUY",
+            "child_order_ids": ["entry-flat"],
+            "exchange_stop_order_id": "stop-flat-a",
+            "exchange_stop_order_ids": ["stop-flat-a", "stop-flat-b"],
+            "open_base": "1",
+        },
+    )
+    await _seed_iceberg_row(
+        db,
+        "zero-list",
+        {
+            "exit_state": "DONE",
+            "exchange_stop_order_id": "stop-zero-a",
+            "exchange_stop_order_ids": ["stop-zero-a", "stop-zero-b"],
+            "open_base": "0",
+        },
+    )
+    await _seed_iceberg_row(
+        db,
+        "done-list",
+        {
+            "exit_state": "DONE",
+            "exchange_stop_order_ids": ["stop-done-a", "stop-done-b"],
+            "open_base": "1",
+        },
+    )
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            "done-list", status="TERMINATED", close_type="FAILED"
+        )
+    connector = _Connector()
+    connector.account_positions = _long_position("0")
+    connector.in_flight_orders["entry-flat"] = _open_order()
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    cancelled = {order_id for _pair, order_id in connector.cancels}
+    assert "entry-flat" in cancelled
+    for stop_id in (
+        "stop-flat-a",
+        "stop-flat-b",
+        "stop-zero-a",
+        "stop-zero-b",
+        "stop-done-a",
+        "stop-done-b",
+    ):
+        assert stop_id not in cancelled
+        assert stop_id in connector.stop_cancels
+    assert "open_base is 0" in caplog.text
+    assert "not RUNNING and was not parked for resume" in caplog.text
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "flat-list")
+    assert row.close_type == "CLOSED_WHILE_DOWN"
+
+
+@pytest.mark.asyncio
+async def test_stop_route_cancels_every_exchange_stop_id():
+    connector = _Connector()
+    executor = _Executor([], custom_info={
+        "exchange_stop_order_id": "stop-1",
+        "exchange_stop_order_ids": ["stop-1", "stop-2"],
+        "open_base": "1",
+        "side": "BUY",
+    })
+    service = _service(connectors={"master": {"mexc_perpetual": connector}})
+    metadata = {
+        "account_name": "master",
+        "connector_name": "mexc_perpetual",
+        "trading_pair": "BTC-USDT",
+        "executor_type": "range_iceberg_executor",
+    }
+    service._active_executors["ex-1"] = executor
+    service._executor_metadata["ex-1"] = metadata
+    await service.stop_executor("ex-1", keep_position=False)
+    assert connector.cancels == []
+    assert connector.stop_cancels == ["stop-1", "stop-2"]
+
+    connector.stop_cancels.clear()
+    kept = _Executor([], custom_info={
+        "exchange_stop_order_id": "stop-1",
+        "exchange_stop_order_ids": ["stop-1", "stop-2"],
+        "open_base": "1",
+    })
+    service._active_executors["ex-2"] = kept
+    service._executor_metadata["ex-2"] = metadata
+    await service.stop_executor("ex-2", keep_position=True)
+    assert connector.stop_cancels == []
+    assert connector.cancels == []
+
+
+@pytest.mark.asyncio
+async def test_direct_cancel_false_and_gone_is_already_gone(db, caplog):
+    await _seed_executor(
+        db,
+        "gone-exec",
+        "master",
+        "mexc_perpetual",
+        "BTC-USDT",
+        {"child_order_ids": ["gone-oid", "stuck-oid"]},
+        [("gone-oid", "OPEN"), ("stuck-oid", "OPEN")],
+    )
+    await _seed_exchange_order(db, "gone-oid", "OPEN")
+    await _seed_exchange_order(db, "stuck-oid", "OPEN")
+
+    class _DecliningConnector(_Connector):
+        def __init__(self):
+            super().__init__()
+            self.direct = []
+            self.open_orders = [{"externalOid": "stuck-oid", "orderId": "9002"}]
+
+        async def cancel(self, trading_pair=None, client_order_id=None):
+            self.cancels.append((trading_pair, client_order_id))
+
+        async def _place_cancel(self, order_id, tracked):
+            self.direct.append(order_id)
+            return False
+
+        async def list_open_orders(self, trading_pair=None):
+            return list(self.open_orders)
+
+    connector = _DecliningConnector()
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    with caplog.at_level(logging.INFO):
+        await service.cleanup_orphaned_executors()
+    assert connector.cancels == []
+    assert connector.direct == ["gone-oid", "stuck-oid"]
+    assert "Software order gone-oid for executor gone-exec" in caplog.text
+    assert "was already gone" in caplog.text
+    assert "Cancelled open child order gone-oid" not in caplog.text
+    assert "Failed to cancel open child order stuck-oid" in caplog.text
+    assert "was rejected" in caplog.text
+    assert "Software order stuck-oid" not in caplog.text

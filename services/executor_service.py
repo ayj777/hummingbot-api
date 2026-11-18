@@ -110,7 +110,8 @@ def child_order_ids_from_custom_info(custom_info: Any) -> tuple[List[str], List[
     client order id, including iceberg children) and per-level ``filled`` flags.
     Position, DCA and TWAP report ``order_ids``. Order executor reports a single
     ``order_id``. Filled ids and ``held_position_orders`` are the exposure to keep,
-    not orders to cancel. ``exchange_stop_order_id`` is not an order to cancel here.
+    not orders to cancel. ``exchange_stop_order_id`` and ``exchange_stop_order_ids``
+    are exchange stops, not software orders to cancel here.
     """
     if not isinstance(custom_info, dict):
         return [], []
@@ -190,10 +191,48 @@ def _exit_state_name(custom_info: Any) -> Optional[str]:
     return text or None
 
 
-def _exchange_stop_id(custom_info: Any) -> Optional[str]:
+def _exchange_stop_ids(custom_info: Any) -> List[str]:
+    """Every live exchange stop id for this executor.
+
+    ``exchange_stop_order_ids`` is the full list. The primary
+    ``exchange_stop_order_id`` is included when that list is absent or does
+    not already contain it.
+    """
     if not isinstance(custom_info, dict):
-        return None
-    return _order_id_text(custom_info.get("exchange_stop_order_id"))
+        return []
+    ids: List[str] = []
+    seen: set = set()
+
+    def add(value: Any) -> None:
+        oid = _order_id_text(value) if not isinstance(value, dict) else _dict_order_id(value)
+        if oid and oid not in seen:
+            seen.add(oid)
+            ids.append(oid)
+
+    listed = custom_info.get("exchange_stop_order_ids")
+    if isinstance(listed, list):
+        for item in listed:
+            add(item)
+    else:
+        add(custom_info.get("exchange_stop_order_id"))
+        return ids
+    add(custom_info.get("exchange_stop_order_id"))
+    return ids
+
+
+def _exchange_stop_id(custom_info: Any) -> Optional[str]:
+    """Primary exchange stop id, or the first id when only the list is set."""
+    if isinstance(custom_info, dict):
+        primary = _order_id_text(custom_info.get("exchange_stop_order_id"))
+        if primary:
+            return primary
+    ids = _exchange_stop_ids(custom_info)
+    return ids[0] if ids else None
+
+
+def _exchange_stop_text(custom_info: Any) -> str:
+    ids = _exchange_stop_ids(custom_info)
+    return ", ".join(ids) if ids else "none"
 
 
 def _open_base_is_zero(custom_info: Any) -> bool:
@@ -376,6 +415,7 @@ def _exit_only_custom_info(
     exit_blob = custom.get("exit") if isinstance(custom.get("exit"), dict) else {}
     exit_state = custom.get("exit_state") or exit_blob.get("exit_state")
     active = custom.get("exit_active") or exit_blob.get("active")
+    stop_ids = _exchange_stop_ids(custom)
     payload: Dict[str, Any] = {
         _RESUME_ENTRIES: False,
         "size_unit": "BASE",
@@ -388,7 +428,8 @@ def _exit_only_custom_info(
         "closed_base": "0",
         "filled_quote": quote,
         "average_fill_price": average_text,
-        "exchange_stop_order_id": custom.get("exchange_stop_order_id"),
+        "exchange_stop_order_id": _exchange_stop_id(custom),
+        "exchange_stop_order_ids": stop_ids,
         "child_order_ids": [],
         "exit_order_ids": [],
     }
@@ -400,7 +441,8 @@ def _exit_only_custom_info(
         "active": active,
         "status": _exit_phase_for_state(exit_state),
         "exit_state": exit_state,
-        "exchange_stop_order_id": custom.get("exchange_stop_order_id"),
+        "exchange_stop_order_id": _exchange_stop_id(custom),
+        "exchange_stop_order_ids": stop_ids,
         "trigger_price": exit_blob.get("trigger_price"),
         "entry_filled_base": amount,
         "entry_filled_quote": quote,
@@ -430,9 +472,9 @@ def _resume_search_fields(custom_info: Any) -> Dict[str, Any]:
 def _live_order_ids_from_custom(custom_info: Any) -> List[str]:
     working, _filled = child_order_ids_from_custom_info(custom_info)
     ids = list(working)
-    stop_id = _exchange_stop_id(custom_info)
-    if stop_id and stop_id not in ids:
-        ids.append(stop_id)
+    for stop_id in _exchange_stop_ids(custom_info):
+        if stop_id not in ids:
+            ids.append(stop_id)
     return ids
 
 
@@ -719,16 +761,16 @@ class ExecutorService:
         Range iceberg executors that graceful shutdown persisted for resume
         (exit_state ARMED, RESTING, or CLOSING) are started from that saved state
         before anything else. A resumed executor does not continue an unfinished
-        entry. It resumes exits only, sized to the exchange position. Only its
-        exchange stop stays up. Entry and exit client order ids are cancelled
+        entry. It resumes exits only, sized to the exchange position. Every
+        exchange stop id stays up. Entry and exit client order ids are cancelled
         for every executor, resumed ones included.
 
-        An exchange stop on an executor that is not RUNNING and was not parked
-        with resume_on_startup is cancelled here as well, except a POSITION_HOLD
+        Exchange stops on an executor that is not RUNNING and was not parked
+        with resume_on_startup are cancelled here as well, except a POSITION_HOLD
         row, which kept the position on purpose. A failed resume leaves its
-        exchange stop in place and records the failure on the row. A flat
+        exchange stops in place and records the failure on the row. A flat
         exchange position is not resumed: the row is marked CLOSED_WHILE_DOWN
-        and its exchange stop is cancelled.
+        and its exchange stops are cancelled.
         """
         if not self.db_manager:
             logger.debug("No database manager available, skipping orphaned executor cleanup")
@@ -777,7 +819,7 @@ class ExecutorService:
         Each executor still running is asked to early_stop with keep_position, which
         cancels software entry and exit orders and does not close a filled position.
         A range iceberg whose exit_state is ARMED, RESTING, or CLOSING is persisted
-        after those cancels are confirmed. Only its exchange stop stays on the
+        after those cancels are confirmed. Every exchange stop id stays on the
         exchange. Shutdown waits, up to SHUTDOWN_CANCEL_TIMEOUT_SECONDS, for the
         software cancels. Connector teardown happens only after this method returns.
         """
@@ -838,7 +880,7 @@ class ExecutorService:
                         "shutdown. Startup will cancel leftover entry and exit orders. "
                         "Left exchange stop %s on the exchange.",
                         executor_id,
-                        _exchange_stop_id(self._safe_custom_info(executor)) or "none",
+                        _exchange_stop_text(self._safe_custom_info(executor)),
                     )
                 await self._persist_range_iceberg_for_resume(executor_id, executor)
                 continue
@@ -933,7 +975,7 @@ class ExecutorService:
                 logger.error(
                     "No executor row to store resume state for %s. Left exchange stop %s on the exchange.",
                     executor_id,
-                    _exchange_stop_id(payload) or "none",
+                    _exchange_stop_text(payload),
                 )
         except Exception as exc:
             logger.error("Could not store resume state for executor %s: %s", executor_id, exc)
@@ -951,13 +993,13 @@ class ExecutorService:
         if info is None:
             info = self._custom_info_for_snapshot(executor)
         state = _exit_state_name(info) if info is not None else None
-        stop_id = _exchange_stop_id(info)
+        stop_text = _exchange_stop_text(info)
         if info is None:
             logger.error(
                 "Could not read custom_info while persisting range iceberg executor %s for resume. "
                 "Left exchange stop %s on the exchange.",
                 executor_id,
-                stop_id or "none",
+                stop_text,
             )
         else:
             payload = dict(info)
@@ -974,7 +1016,7 @@ class ExecutorService:
             "Software entry and exit orders were cancelled. Left exchange stop %s on the exchange.",
             executor_id,
             state or "unknown",
-            stop_id or "none",
+            stop_text,
         )
 
     async def _load_resume_candidates(self) -> List[Dict[str, Any]]:
@@ -1015,13 +1057,13 @@ class ExecutorService:
         if not self.db_manager:
             return
         custom = dict(item.get("custom") or {})
-        stop_id = _exchange_stop_id(custom)
+        stop_text = _exchange_stop_text(custom)
         custom[_RESUME_FAILED] = True
         custom[_RESUME_ERROR] = message
         custom[_RESUME_ON_STARTUP] = False
         text = (
             f"Resume failed for range iceberg executor {item['executor_id']}: {message}. "
-            f"Left exchange stop {stop_id or 'none'} on the exchange."
+            f"Left exchange stop {stop_text} on the exchange."
         )
         try:
             final_state = json.dumps(custom, default=_json_default)
@@ -1122,11 +1164,10 @@ class ExecutorService:
             self._drop_executor_memory(executor_id)
             raise
 
-        # Only the exchange stop is protected. Entry and exit client order ids
+        # Every exchange stop is protected. Entry and exit client order ids
         # are leftover software orders and startup cancels them, including for
         # this resumed executor.
-        stop_id = _exchange_stop_id(custom)
-        return [stop_id] if stop_id else []
+        return _exchange_stop_ids(custom)
 
     def _saved_side_name(self, item: Dict[str, Any]) -> str:
         custom = item.get("custom") or {}
@@ -1219,12 +1260,12 @@ class ExecutorService:
         if not self.db_manager:
             return
         custom = dict(item.get("custom") or {})
-        stop_id = _exchange_stop_id(custom)
+        stop_text = _exchange_stop_text(custom)
         custom[_RESUME_ON_STARTUP] = False
         custom["closed_while_down"] = True
         message = (
             f"Position for range iceberg executor {item['executor_id']} was flat on the exchange "
-            f"while the API was down. Cancelled exchange stop {stop_id or 'none'}."
+            f"while the API was down. Cancelled exchange stop {stop_text}."
         )
         custom[_RESUME_ERROR] = message
         try:
@@ -1295,6 +1336,32 @@ class ExecutorService:
         )
         return None
 
+    async def _cancel_exchange_stops(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        executor_id: str,
+        stop_ids: List[str],
+        reason: str,
+    ) -> Optional[str]:
+        """Cancel every exchange stop. None when each one is confirmed."""
+        errors: List[str] = []
+        for stop_id in stop_ids:
+            error = await self._cancel_exchange_stop_now(
+                account_name,
+                connector_name,
+                trading_pair,
+                executor_id,
+                stop_id,
+                reason,
+            )
+            if error:
+                errors.append(error)
+        if errors:
+            return "; ".join(errors)
+        return None
+
     async def _park_flat(self, item: Dict[str, Any], reason: str) -> None:
         """Leave the row RUNNING so software orders are still cancelled, then close it."""
         flats = getattr(self, "_flat_while_down", None)
@@ -1302,13 +1369,13 @@ class ExecutorService:
             flats = []
             self._flat_while_down = flats
         flats.append(item)
-        stop_id = _exchange_stop_id(item.get("custom"))
-        error = await self._cancel_exchange_stop_now(
+        stop_ids = _exchange_stop_ids(item.get("custom"))
+        error = await self._cancel_exchange_stops(
             item.get("account_name") or self.default_account,
             item.get("connector_name") or "",
             item.get("trading_pair") or "",
             item["executor_id"],
-            stop_id,
+            stop_ids,
             reason,
         )
         if error:
@@ -1321,7 +1388,7 @@ class ExecutorService:
             item.get("connector_name"),
             item.get("trading_pair"),
             reason,
-            stop_id or "none",
+            ", ".join(stop_ids) if stop_ids else "none",
         )
 
     async def _resume_allocated_positions(
@@ -1397,19 +1464,18 @@ class ExecutorService:
                 attempt = dict(item)
                 attempt["custom"] = _exit_only_custom_info(custom, share, average)
                 state = item.get("_state")
-                stop_id = _exchange_stop_id(custom)
+                stop_ids = _exchange_stop_ids(custom)
                 try:
                     live_ids = await self._resume_one_range_iceberg(attempt)
                 except Exception as exc:
                     await self._mark_resume_failed(item, str(exc))
-                    if stop_id:
-                        protected.add(stop_id)
+                    protected.update(stop_ids)
                     logger.error(
                         "Failed to resume range iceberg executor %s (exit_state=%s). "
                         "Left exchange stop %s on the exchange. %s",
                         item["executor_id"],
                         state,
-                        stop_id or "none",
+                        ", ".join(stop_ids) if stop_ids else "none",
                         exc,
                     )
                     continue
@@ -1423,7 +1489,7 @@ class ExecutorService:
                     item["executor_id"],
                     state,
                     format(share, "f"),
-                    stop_id or "none",
+                    ", ".join(stop_ids) if stop_ids else "none",
                 )
             if len(items) > 1:
                 logger.info(
@@ -1441,7 +1507,7 @@ class ExecutorService:
 
         A resumed executor does not continue an unfinished entry. The restore
         payload sets resume_entries false and sizes the exit to the reconciled
-        open base. Only the exchange stop is protected from the cleanup that
+        open base. Every exchange stop id is protected from the cleanup that
         follows. Entry and exit client order ids are cancelled with every
         other leftover software order.
         """
@@ -1458,20 +1524,20 @@ class ExecutorService:
             executor_id = item["executor_id"]
             custom = item["custom"]
             state = _exit_state_name(custom)
-            stop_id = _exchange_stop_id(custom)
+            stop_ids = _exchange_stop_ids(custom)
+            stop_text = ", ".join(stop_ids) if stop_ids else "none"
             if state not in _RESUMABLE_EXIT_STATES:
                 await self._mark_resume_failed(
                     item,
                     f"saved exit_state {state or 'missing'} cannot be resumed",
                 )
-                if stop_id:
-                    protected.add(stop_id)
+                protected.update(stop_ids)
                 logger.error(
                     "Failed to resume range iceberg executor %s (exit_state=%s). "
                     "Left exchange stop %s on the exchange. saved exit_state cannot be resumed",
                     executor_id,
                     state or "missing",
-                    stop_id or "none",
+                    stop_text,
                 )
                 continue
             side_name = self._saved_side_name(item)
@@ -1495,14 +1561,13 @@ class ExecutorService:
                     item,
                     "could not read the exchange position before resume",
                 )
-                if stop_id:
-                    protected.add(stop_id)
+                protected.update(stop_ids)
                 logger.error(
                     "Failed to resume range iceberg executor %s (exit_state=%s). "
                     "Left exchange stop %s on the exchange. could not read the exchange position",
                     executor_id,
                     state,
-                    stop_id or "none",
+                    stop_text,
                 )
                 continue
             actual, entry_price = snapshot
@@ -1739,10 +1804,10 @@ class ExecutorService:
         Order ids come from executor_orders and from the custom_info snapshot stored
         on the executor row, including exit_order_ids. Filled orders are left alone.
         A resumed executor is in active_executor_ids. Its entry and exit client
-        order ids are still cancelled. Only its exchange stop is in
-        protected_order_ids. A non-resumed exchange stop is cancelled when
-        open_base is 0. A failed resume puts its stop in protected_order_ids so
-        it stays up.
+        order ids are still cancelled. Every exchange stop id of a resumed
+        executor is in protected_order_ids. A non-resumed exchange stop is
+        cancelled when open_base is 0. A failed resume puts its stops in
+        protected_order_ids so they stay up.
         """
         if not self.db_manager:
             return
@@ -1773,15 +1838,19 @@ class ExecutorService:
                         continue
                     seen.add(oid)
                     order_ids.append(oid)
-                stop_id = _exchange_stop_id(custom)
+                stop_ids = _exchange_stop_ids(custom)
                 resumed = record.executor_id in resumed_ids
-                cancel_stop = bool(stop_id) and not resumed and _open_base_is_zero(custom)
-                if stop_id:
-                    order_ids = [oid for oid in order_ids if oid != stop_id]
+                cancel_stop = bool(stop_ids) and not resumed and _open_base_is_zero(custom)
+                if stop_ids:
+                    stop_set = set(stop_ids)
+                    order_ids = [oid for oid in order_ids if oid not in stop_set]
                 if protected:
                     order_ids = [oid for oid in order_ids if oid not in protected]
-                stop_to_cancel = stop_id if cancel_stop and stop_id not in protected else None
-                if not order_ids and not stop_to_cancel:
+                stops_to_cancel = [
+                    stop_id for stop_id in stop_ids
+                    if cancel_stop and stop_id not in protected
+                ]
+                if not order_ids and not stops_to_cancel:
                     continue
                 db_orders = await order_repo.get_orders_by_client_ids(order_ids)
                 db_status = {row.client_order_id: row.status for row in db_orders}
@@ -1799,7 +1868,7 @@ class ExecutorService:
                     "filled_ids": set(filled),
                     "db_status": db_status,
                     "exchange_ids": exchange_ids,
-                    "stop_id": stop_to_cancel,
+                    "stop_ids": stops_to_cancel,
                 })
 
         for item in pending:
@@ -1807,13 +1876,13 @@ class ExecutorService:
             book = getattr(connector, "in_flight_orders", None) if connector is not None else None
             if not isinstance(book, dict):
                 book = {}
-            if item.get("stop_id"):
-                await self._cancel_exchange_stop_now(
+            if item.get("stop_ids"):
+                await self._cancel_exchange_stops(
                     item["account_name"],
                     item["connector_name"],
                     item["trading_pair"],
                     item["executor_id"],
-                    item["stop_id"],
+                    item["stop_ids"],
                     "open_base is 0",
                 )
             for order_id in item["order_ids"]:
@@ -1822,7 +1891,7 @@ class ExecutorService:
                 if not self._child_order_still_open(order_id, book, item["db_status"].get(order_id)):
                     continue
                 try:
-                    await self._cancel_software_order(
+                    outcome = await self._cancel_software_order(
                         connector,
                         item["trading_pair"],
                         order_id,
@@ -1836,6 +1905,15 @@ class ExecutorService:
                         item["connector_name"],
                         item["trading_pair"],
                         e,
+                    )
+                    continue
+                if outcome == "already_gone":
+                    logger.info(
+                        "Software order %s for executor %s on %s %s was already gone",
+                        order_id,
+                        item["executor_id"],
+                        item["connector_name"],
+                        item["trading_pair"],
                     )
                     continue
                 logger.info(
@@ -1871,24 +1949,27 @@ class ExecutorService:
                     continue
                 if custom.get(_EXCHANGE_STOP_CANCELLED) is True:
                     continue
-                stop_id = _exchange_stop_id(custom)
-                if not stop_id or stop_id in protected:
+                stop_ids = [
+                    stop_id for stop_id in _exchange_stop_ids(custom)
+                    if stop_id not in protected
+                ]
+                if not stop_ids:
                     continue
                 pending.append({
                     "executor_id": record.executor_id,
                     "account_name": record.account_name,
                     "connector_name": record.connector_name,
                     "trading_pair": record.trading_pair,
-                    "stop_id": stop_id,
+                    "stop_ids": stop_ids,
                     "custom": custom,
                 })
         for item in pending:
-            error = await self._cancel_exchange_stop_now(
+            error = await self._cancel_exchange_stops(
                 item["account_name"],
                 item["connector_name"],
                 item["trading_pair"],
                 item["executor_id"],
-                item["stop_id"],
+                item["stop_ids"],
                 "the executor is not RUNNING and was not parked for resume",
             )
             custom = dict(item["custom"])
@@ -1985,12 +2066,16 @@ class ExecutorService:
         trading_pair: str,
         client_order_id: str,
         exchange_order_id: Optional[str],
-    ) -> None:
+    ) -> bool:
         """Cancel an order the fresh tracker does not know.
 
         ``connector.cancel`` returns without calling the exchange when the
         order was never tracked by this process. Cancel by exchange order id
         through ``_place_cancel`` (or ``cancel_order_by_exchange_id``).
+
+        False means the direct call reported that it did not cancel. The
+        caller checks the open-order list before treating that as a rejection:
+        an unknown id that is already gone is not a failed cancel.
         """
         placer = getattr(connector, "_place_cancel", None)
         if callable(placer):
@@ -2002,17 +2087,13 @@ class ExecutorService:
             result = placer(client_order_id, target)
             if asyncio.iscoroutine(result):
                 result = await result
-            if result is False:
-                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
-            return
+            return result is not False
         named = getattr(connector, "cancel_order_by_exchange_id", None)
         if callable(named) and exchange_order_id:
             result = named(exchange_order_id)
             if asyncio.iscoroutine(result):
                 result = await result
-            if result is False:
-                raise RuntimeError(f"direct cancel of exchange order {exchange_order_id} was rejected")
-            return
+            return result is not False
         raise RuntimeError(f"no direct cancel for untracked order {client_order_id}")
 
     async def _cancel_software_order(
@@ -2021,19 +2102,23 @@ class ExecutorService:
         trading_pair: str,
         client_order_id: str,
         exchange_order_id: Optional[str],
-    ) -> None:
+    ) -> Optional[str]:
         """Cancel one software order and confirm it is no longer open.
 
         A tracked order uses ``connector.cancel``. An untracked order uses the
         direct cancel path. When the connector can list open orders, success
         requires that the id is gone from that list.
+
+        Returns ``already_gone`` when the direct cancel reports that it did
+        not cancel, and the open-order list shows the id is not working.
         """
+        direct_declined = False
         tracked = connector is not None and self._software_order_is_tracked(connector, client_order_id)
         if tracked:
             await self._cancel_on_connector(connector, trading_pair, client_order_id)
         else:
             try:
-                await self._cancel_untracked_software_order(
+                accepted = await self._cancel_untracked_software_order(
                     connector, trading_pair, client_order_id, exchange_order_id
                 )
             except RuntimeError as exc:
@@ -2043,13 +2128,23 @@ class ExecutorService:
                 # only call it exposes. An open-order query below rejects it
                 # when that call left the order working.
                 await self._cancel_on_connector(connector, trading_pair, client_order_id)
+            else:
+                direct_declined = not accepted
         open_rows = await self._open_orders(connector, trading_pair)
         if open_rows is None:
-            return
-        if any(self._open_row_matches(row, client_order_id, exchange_order_id) for row in open_rows):
-            raise RuntimeError(
-                f"order {client_order_id} is still open after cancel"
-            )
+            if direct_declined:
+                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
+            return None
+        still_open = any(
+            self._open_row_matches(row, client_order_id, exchange_order_id) for row in open_rows
+        )
+        if still_open:
+            if direct_declined:
+                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
+            raise RuntimeError(f"order {client_order_id} is still open after cancel")
+        if direct_declined:
+            return "already_gone"
+        return None
 
     @staticmethod
     def _stop_cancel_error(result: Any, stop_id: str) -> Optional[str]:
@@ -2886,19 +2981,19 @@ class ExecutorService:
             db_record = await self.get_executor(executor_id)
             if db_record:
                 custom_info = db_record.get("custom_info") or {}
-                stop_id = _exchange_stop_id(custom_info)
+                stop_ids = _exchange_stop_ids(custom_info)
                 if (
-                    stop_id
+                    stop_ids
                     and db_record.get("status") != "RUNNING"
                     and custom_info.get(_RESUME_ON_STARTUP) is not True
                     and db_record.get("close_type") != "POSITION_HOLD"
                 ):
-                    await self._cancel_exchange_stop_now(
+                    await self._cancel_exchange_stops(
                         db_record.get("account_name") or getattr(self, "default_account", "") or "",
                         db_record.get("connector_name") or "",
                         db_record.get("trading_pair") or "",
                         executor_id,
-                        stop_id,
+                        stop_ids,
                         "the executor is not RUNNING and was not parked for resume",
                     )
                 logger.info(
@@ -2931,14 +3026,14 @@ class ExecutorService:
 
         if not keep_position:
             metadata = self._executor_metadata.get(executor_id, {})
-            stop_id = _exchange_stop_id(self._safe_custom_info(executor))
-            if stop_id:
-                await self._cancel_exchange_stop_now(
+            stop_ids = _exchange_stop_ids(self._safe_custom_info(executor))
+            if stop_ids:
+                await self._cancel_exchange_stops(
                     metadata.get("account_name") or getattr(self, "default_account", "") or "",
                     metadata.get("connector_name") or "",
                     metadata.get("trading_pair") or "",
                     executor_id,
-                    stop_id,
+                    stop_ids,
                     "stop was requested without keep_position",
                 )
 
@@ -3091,14 +3186,14 @@ class ExecutorService:
         else:
             # FAILED and a user stop without keep_position leave the exchange
             # stop up. Cancel it here, and again on the next startup if this misses.
-            stop_id = _exchange_stop_id(self._safe_custom_info(executor))
-            if stop_id:
-                await self._cancel_exchange_stop_now(
+            stop_ids = _exchange_stop_ids(self._safe_custom_info(executor))
+            if stop_ids:
+                await self._cancel_exchange_stops(
                     metadata.get("account_name") or getattr(self, "default_account", "") or "",
                     metadata.get("connector_name") or "",
                     metadata.get("trading_pair") or "",
                     executor_id,
-                    stop_id,
+                    stop_ids,
                     "the executor ended without keep_position",
                 )
 
