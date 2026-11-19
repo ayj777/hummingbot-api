@@ -18,7 +18,7 @@ from hummingbot.core.data_type.common import (
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
-from bots.controllers.directional_trading.aiot_engine import STRATEGIES, Intent, Sleeve
+from bots.controllers.directional_trading.aiot_engine import STRATEGIES, Bar, Intent, Sleeve
 from bots.controllers.directional_trading.aiot_research import (
     AiotResearchConfig,
     AiotResearchController,
@@ -81,6 +81,7 @@ def _controller(connector, strategy="f1", **overrides):
     controller._exit_reserved = Decimal("0")
     controller._drawdown_cap = None
     controller._entries_halted = False
+    controller._atr_fallback = False
     controller._sleeves = []
     controller.market_data_provider = SimpleNamespace(
         connectors={"mexc_paper_trade": connector},
@@ -629,3 +630,46 @@ def test_entries_use_a_fresh_balance():
     assert keep is False
     quote = actions[0].executor_config.amount * PRICE
     assert quote < Decimal("500")
+
+
+def _flat_hour_bars():
+    hours = []
+    for index in range(20):
+        hours.append(Bar(index * 3600, 0.10, 0.101, 0.099, 0.10))
+    signal = [Bar(14 * 3600, 0.10, 0.101, 0.099, 0.10)]
+    return {"15m": signal, "1h": hours}
+
+
+def test_fin_b_adoption_always_sets_a_stop():
+    position = SimpleNamespace(
+        trading_pair="AIOT-USDT",
+        position_side=PositionSide.LONG,
+        amount=Decimal("1000"),
+        entry_price=Decimal("0.10"),
+    )
+    connector = SimpleNamespace(
+        account_positions={"k": position},
+        ready=True,
+        get_available_balance=lambda asset: Decimal("5925"),
+        trading_rules={"AIOT-USDT": _Rule()},
+    )
+    controller = _controller(connector, strategy="fin_b")
+    controller.processed_data = {}
+    sleeve = Sleeve(STRATEGIES["fin_b"].sleeves[0])
+    controller._sleeves = [sleeve]
+    controller._apply_live_position()
+    assert sleeve.phase == "open"
+    assert sleeve.base == 1000.0
+    assert sleeve.stop_price is not None and sleeve.stop_price > 0
+    assert abs(sleeve.stop_price - 0.085) < 1e-9
+    assert controller._atr_fallback is True
+    intent = Intent("core", "market_buy", 1.0, 15000.0, "entry", 1, None, 0.10)
+    actions, keep = controller._buy_actions(intent)
+    assert actions == []
+    assert keep is True
+    controller.processed_data = {"frames": _flat_hour_bars()}
+    controller._apply_live_position()
+    assert controller._atr_fallback is False
+    assert sleeve.entry_atr is not None
+    assert abs(sleeve.stop_price - (0.10 - 5.0 * sleeve.entry_atr)) < 1e-9
+    assert sleeve.stop_price > 0

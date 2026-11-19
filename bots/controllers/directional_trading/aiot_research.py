@@ -118,6 +118,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
         self._exit_reserved = Decimal("0")
         self._drawdown_cap = None
         self._entries_halted = False
+        self._atr_fallback = False
         self._warned = set()
         self._leverage_ready = False
         self._leverage_inflight = False
@@ -358,7 +359,8 @@ class AiotResearchController(DirectionalTradingControllerBase):
     def _buy_actions(self, intent: Intent):
         if not self._entries_allowed():
             self._schedule_leverage()
-            if not self._position_blocks_entries():
+            blocked = self._position_blocks_entries() or getattr(self, "_atr_fallback", False)
+            if not blocked:
                 self._warn_once(
                     "leverage",
                     "AIOT held an entry until leverage 1 isolated is confirmed.",
@@ -451,6 +453,12 @@ class AiotResearchController(DirectionalTradingControllerBase):
 
     def _entries_allowed(self) -> bool:
         if getattr(self, "_entries_halted", False):
+            return False
+        if getattr(self, "_atr_fallback", False):
+            self._warn_once(
+                "atr",
+                "AIOT entries stay off until ATR can set the stop.",
+            )
             return False
         if self._position_blocks_entries():
             self._warn_once(
@@ -603,6 +611,13 @@ class AiotResearchController(DirectionalTradingControllerBase):
             self._flat_streak = 0
             self._live_long = mapped
             self._sync_sleeves_to_long(mapped, connector)
+            self._upgrade_fallback_stop()
+            for sleeve in self._sleeves:
+                if sleeve.base <= 1e-12:
+                    continue
+                if not sleeve.stop_price:
+                    self._arm_adopted_stop(sleeve, connector)
+                assert sleeve.stop_price is not None and sleeve.stop_price > 0
             return
         seen = getattr(self, "_positions_seen", False)
         streak = getattr(self, "_flat_streak", 0)
@@ -641,13 +656,59 @@ class AiotResearchController(DirectionalTradingControllerBase):
         entry = long_entry_price(connector, self.config.trading_pair)
         if entry is None:
             entry = self._mid_price()
+        atr = None
+        if getattr(sleeve.spec, "stop_atr_mult", None):
+            atr = self._current_atr()
         saved = (self._stop or {}).get("price")
-        stop = hard_stop_for_entry(sleeve.spec, entry, saved)
+        stop, fallback = hard_stop_for_entry(sleeve.spec, entry, saved, atr)
         if stop is None:
             return
         sleeve.stop_price = stop
         if sleeve.first_fill_price is None and entry is not None:
             sleeve.first_fill_price = float(entry)
+        if atr and not fallback:
+            sleeve.entry_atr = atr
+        if fallback:
+            self._atr_fallback = True
+
+    def _current_atr(self):
+        data = getattr(self, "processed_data", None) or {}
+        frames = data.get("frames") or {}
+        signal = frames.get(self._spec.signal_interval) or []
+        if not signal:
+            return None
+        htf = frames.get(self._spec.htf_interval) if self._spec.htf_interval else None
+        try:
+            contexts = build_contexts(
+                signal,
+                self._spec.signal_interval,
+                htf,
+                self._spec.htf_interval,
+                self._spec.htf_mode,
+            )
+        except (TypeError, ValueError):
+            return None
+        if not contexts or contexts[-1].atr is None or contexts[-1].atr <= 0:
+            return None
+        return contexts[-1].atr
+
+    def _upgrade_fallback_stop(self) -> None:
+        if not getattr(self, "_atr_fallback", False):
+            return
+        atr = self._current_atr()
+        if atr is None:
+            return
+        for sleeve in self._sleeves:
+            mult = getattr(sleeve.spec, "stop_atr_mult", None)
+            entry = sleeve.first_fill_price
+            if not mult or not entry or sleeve.base <= 0:
+                continue
+            stop = float(entry) - float(mult) * atr
+            if stop <= 0:
+                continue
+            sleeve.entry_atr = atr
+            sleeve.stop_price = stop
+        self._atr_fallback = False
 
     def _schedule_position_fetch(self, connector) -> None:
         if connector is None or not callable(getattr(connector, "_update_positions", None)):
@@ -1042,23 +1103,39 @@ def long_entry_price(connector, trading_pair: str):
     return None
 
 
-def hard_stop_for_entry(spec, entry, saved=None):
-    if entry is not None and getattr(spec, "stop_pct", None):
-        try:
-            price = float(entry)
-        except (TypeError, ValueError):
-            price = 0.0
-        if price > 0:
-            return price * (1.0 - float(spec.stop_pct))
-    if saved in (None, ""):
-        return None
+def hard_stop_for_entry(spec, entry, saved=None, atr=None):
+    """Return the stop price and whether it is the 15 percent fallback.
+
+    An ATR strategy uses entry minus the multiple times the current ATR, the
+    same formula as a fresh entry. With no ATR yet, 15 percent still places a
+    stop. A percent strategy keeps its own percent.
+    """
     try:
-        price = float(saved)
+        price = float(entry) if entry is not None else 0.0
     except (TypeError, ValueError):
-        return None
-    if price <= 0:
-        return None
-    return price
+        price = 0.0
+    if price > 0 and getattr(spec, "stop_pct", None):
+        return price * (1.0 - float(spec.stop_pct)), False
+    mult = getattr(spec, "stop_atr_mult", None)
+    if price > 0 and mult and atr:
+        try:
+            width = float(atr)
+        except (TypeError, ValueError):
+            width = 0.0
+        if width > 0:
+            stop = price - float(mult) * width
+            if stop > 0:
+                return stop, False
+    if saved not in (None, ""):
+        try:
+            saved_price = float(saved)
+        except (TypeError, ValueError):
+            saved_price = 0.0
+        if saved_price > 0:
+            return saved_price, False
+    if price > 0 and mult:
+        return price * (1.0 - 0.15), True
+    return None, False
 
 
 def stop_order_ids(rows):
