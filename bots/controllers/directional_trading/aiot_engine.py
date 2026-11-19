@@ -448,6 +448,9 @@ class Sleeve:
         self._queued = []
         return queued
 
+    def requeue(self, intent: Intent) -> None:
+        self._queued.append(intent)
+
     def on_price(self, price: float) -> None:
         """Live stop. Queues one market sell when price trades at or below the stop.
 

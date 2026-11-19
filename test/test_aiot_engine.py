@@ -670,7 +670,8 @@ def test_each_shipped_config_matches_its_strategy_and_stays_on_paper():
         assert payload["trading_pair"] == "AIOT-USDT"
         assert payload["candles_trading_pair"] == "AIOT-USDT"
         assert payload["leverage"] == 1
-        assert payload["position_mode"] == "ONEWAY"
+        assert payload["position_mode"] == "HEDGE"
+        assert payload["size_mode"] == "max"
         assert payload["stop_loss"] is None
         assert payload["take_profit"] is None
         assert payload["time_limit"] is None

@@ -7,7 +7,8 @@ candles_connector: mexc
 candles_trading_pair: AIOT-USDT
 total_amount_quote: 15000
 leverage: 1
-position_mode: ONEWAY
+position_mode: HEDGE
+size_mode: max
 strategy: f1
 stop_loss:
 take_profit:
