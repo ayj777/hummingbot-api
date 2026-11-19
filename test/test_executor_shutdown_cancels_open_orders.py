@@ -3375,6 +3375,38 @@ def test_sibling_hints_shrink_only_when_the_live_book_is_short():
     assert after_fill["mid"] == Decimal("5")
     assert after_fill["new"] == Decimal("8")
     assert range_iceberg_sibling_hints([oldest]) == {"old": None}
+    stale_book = range_iceberg_sibling_hints([
+        {
+            "executor_id": "old",
+            "created_at": 1,
+            "open_base": Decimal("6"),
+            "exchange_position_base": Decimal("10"),
+        },
+        {
+            "executor_id": "new",
+            "created_at": 2,
+            "open_base": Decimal("1"),
+            "exchange_position_base": Decimal("10"),
+        },
+    ])
+    assert stale_book == {"old": Decimal("1"), "new": Decimal("6")}
+    assert range_iceberg_sibling_hints([
+        {
+            "executor_id": "old",
+            "created_at": 1,
+            "open_base": Decimal("10"),
+            "exchange_position_base": Decimal("8"),
+        },
+        {
+            "executor_id": "new",
+            "created_at": 2,
+            "open_base": Decimal("10"),
+            "exchange_position_base": Decimal("15"),
+        },
+    ]) == {}
+    missing_open = dict(oldest)
+    missing_open["open_base"] = None
+    assert range_iceberg_sibling_hints([missing_open, mid]) == {}
     flat = dict(oldest)
     flat["exchange_position_base"] = Decimal("0")
     other = dict(mid)
@@ -3424,6 +3456,16 @@ def test_entry_pause_keeps_only_the_deepest_tier_the_price_qualifies_for():
     spent = [_limit_tier("t1", "0.1"), _limit_tier("t2", "0.09", False), _limit_tier("t3", "0.08")]
     assert range_iceberg_entry_pauses(spent, "BUY", Decimal("0.089")) == {
         "t1": None, "t2": None, "t3": None,
+    }
+    partial = [_limit_tier("t1", "0.1"), _limit_tier("t2", "0.09"), _limit_tier("t3", "0.08")]
+    assert range_iceberg_entry_pauses(partial, "BUY", Decimal("0.089"))["t1"] == (
+        "deeper tier t2 active"
+    )
+    held = [_limit_tier("t1", "0.1"), _limit_tier("t2", "0.09"), _limit_tier("t3", "0.08")]
+    held[2]["eligible"] = False
+    assert range_iceberg_entry_pauses(held, "BUY", Decimal("0.079")) == {
+        "t1": "deeper tier t2 active",
+        "t2": None,
     }
     assert range_iceberg_entry_pauses([_limit_tier("only", "0.1")], "BUY", Decimal("0.05")) == {
         "only": None,
@@ -3563,6 +3605,8 @@ async def test_the_eleventh_tier_is_refused_until_an_external_close(db):
     for _ in range(10):
         created = await service.create_executor(_open_config("BUY"), account_name="master")
         ids.append(created["executor_id"])
+    service._active_executors[ids[0]].reported["paused"] = True
+    service._active_executors[ids[1]].reported["entry_paused"] = True
     with pytest.raises(HTTPException) as caught:
         await service.create_executor(_open_config("BUY"), account_name="master")
     assert caught.value.status_code == 409
@@ -3590,6 +3634,9 @@ async def test_sibling_hint_follows_a_partial_close_and_not_a_sibling_fill(db):
     service._sync_range_iceberg_sibling_hints()
     sent = [service._active_executors[executor_id].sibling_calls[-1] for executor_id in ids]
     assert sent == [Decimal("2"), Decimal("5"), Decimal("7")]
+    lengths = [len(service._active_executors[executor_id].sibling_calls) for executor_id in ids]
+    service._sync_range_iceberg_sibling_hints()
+    assert [len(service._active_executors[executor_id].sibling_calls) for executor_id in ids] == lengths
 
     newest = service._active_executors[ids[2]]
     newest.reported["open_base"] = "0"
@@ -3598,6 +3645,38 @@ async def test_sibling_hint_follows_a_partial_close_and_not_a_sibling_fill(db):
     service._sync_range_iceberg_sibling_hints()
     sent = [service._active_executors[executor_id].sibling_calls[-1] for executor_id in ids]
     assert sent == [Decimal("3"), Decimal("5"), Decimal("8")]
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_book_resends_an_unchanged_sibling_hint(db):
+    service = _open_service(db)
+    ids = []
+    for _ in range(2):
+        created = await service.create_executor(_open_config("BUY"), account_name="master")
+        ids.append(created["executor_id"])
+    for executor_id, opened in zip(ids, ("6", "4")):
+        executor = service._active_executors[executor_id]
+        executor.reported["open_base"] = opened
+        executor.reported["exchange_position_base"] = "10"
+    service._sync_range_iceberg_sibling_hints()
+    oldest = service._active_executors[ids[0]]
+    newest = service._active_executors[ids[1]]
+    assert oldest.sibling_calls == [Decimal("4")]
+    assert newest.sibling_calls == [Decimal("6")]
+    service._sync_range_iceberg_sibling_hints()
+    assert newest.sibling_calls == [Decimal("6")]
+
+    newest.reported["open_base"] = "1"
+    service._sync_range_iceberg_sibling_hints()
+    assert oldest.sibling_calls[-1] == Decimal("1")
+    assert newest.sibling_calls == [Decimal("6")]
+
+    for executor_id in ids:
+        service._active_executors[executor_id].reported["exchange_position_base"] = "7"
+    service._sync_range_iceberg_sibling_hints()
+    assert oldest.sibling_calls[-1] == Decimal("1")
+    assert newest.sibling_calls[-1] == Decimal("6")
+    assert len(newest.sibling_calls) == 2
 
 
 async def _limit_executors(db, side, limits):
@@ -3637,6 +3716,13 @@ async def test_entry_pause_dwells_and_leaves_an_unknown_price_alone(db):
     assert calls(0) == [(False, None)]
     service._sync_range_iceberg_entry_pauses()
     assert calls(0)[-1] == (True, f"deeper tier {ids[1]} active")
+    service._active_executors[ids[0]].reported["entry_paused"] = False
+    service._active_executors[ids[0]].reported["pause_reason"] = None
+    service._sync_range_iceberg_entry_pauses()
+    assert len(calls(0)) == 2
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0)[-1] == (True, f"deeper tier {ids[1]} active")
+    assert len(calls(0)) == 3
 
     prices["value"] = None
     frozen = list(calls(0))
@@ -3681,3 +3767,83 @@ async def test_entry_pause_mirrors_sell_limits(db):
     calls = service._active_executors[ids[0]].entry_calls
     assert calls[-1] == (True, f"deeper tier {ids[1]} active")
     assert service._active_executors[ids[1]].entry_calls[-1] == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_a_paused_or_halted_deeper_tier_does_not_silence_the_side(db):
+    service, ids = await _limit_executors(db, "BUY", ("0.1", "0.09", "0.08"))
+    deeper = service._active_executors[ids[2]]
+    deeper.reported["paused"] = True
+    deeper.reported["unknown_order_halt"] = True
+    service._active_executors[ids[1]].reported["unfilled_amount"] = "4"
+    prices = {"value": Decimal("0.079")}
+    service._range_iceberg_reference_price = lambda *_args: prices["value"]
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    assert service._active_executors[ids[0]].entry_calls[-1] == (
+        True, f"deeper tier {ids[1]} active",
+    )
+    assert service._active_executors[ids[1]].entry_calls[-1] == (False, None)
+    assert deeper.entry_calls == []
+
+    service._entry_pause_sent.clear()
+    service._entry_pause_streak.clear()
+    before = list(service._active_executors[ids[0]].entry_calls)
+    service._sync_range_iceberg_entry_pauses()
+    assert service._active_executors[ids[0]].entry_calls == before
+    service._sync_range_iceberg_entry_pauses()
+    assert service._active_executors[ids[0]].entry_calls[-1] == before[-1]
+
+
+@pytest.mark.asyncio
+async def test_an_exit_only_tier_does_not_block_a_shallower_entry(db):
+    service, ids = await _limit_executors(db, "BUY", ("0.1", "0.09"))
+    service._executor_metadata[ids[1]]["config"]["resume_entries"] = False
+    prices = {"value": Decimal("0.089")}
+    service._range_iceberg_reference_price = lambda *_args: prices["value"]
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    assert service._active_executors[ids[0]].entry_calls[-1] == (False, None)
+    assert service._active_executors[ids[1]].entry_calls == []
+
+
+def test_a_failed_mid_does_not_switch_to_the_mark_and_a_stale_mid_is_unknown():
+    service = _service()
+
+    class Conn:
+        def __init__(self):
+            self.mid = Decimal("0.095")
+            self.mark = Decimal("0.095")
+            self.raise_mid = False
+
+        def get_mid_price(self, _pair):
+            if self.raise_mid:
+                raise RuntimeError("book down")
+            return self.mid
+
+        def get_funding_info(self, _pair):
+            return SimpleNamespace(mark_price=self.mark)
+
+    conn = Conn()
+    _use_book(service, conn)
+    assert service._range_iceberg_reference_price(
+        "master", "mexc_perpetual", "BTC-USDT",
+    ) == Decimal("0.095")
+    conn.mark = Decimal("0.08")
+    assert service._range_iceberg_reference_price(
+        "master", "mexc_perpetual", "BTC-USDT",
+    ) is None
+    conn.raise_mid = True
+    conn.mark = Decimal("0.089")
+    assert service._range_iceberg_reference_price(
+        "master", "mexc_perpetual", "BTC-USDT",
+    ) is None
+
+    fresh = _service()
+    mark_only = Conn()
+    mark_only.raise_mid = True
+    mark_only.mark = Decimal("0.09")
+    _use_book(fresh, mark_only)
+    assert fresh._range_iceberg_reference_price(
+        "master", "mexc_perpetual", "BTC-USDT",
+    ) == Decimal("0.09")

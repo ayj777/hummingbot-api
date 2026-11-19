@@ -21,12 +21,13 @@ dependencies:
   - pip
   - pip:
       # Pinned to ayj777/hummingbot PR #10 head, not merged yet.
-      # 5dff9b51f1b8d870c7f120ad5cea922651502c06. Move this pin to the squash
-      # commit on master after that PR merges. Those core changes are not in
+      # 1e813e774ae0abbd8a84c95d78555db0162f7880. This head adds
+      # set_entry_paused. Move this pin to the squash commit on master after
+      # that PR merges. Those core changes are not in
       # a PyPI release yet. utils/core_compatibility.py refuses to start against
       # a core that is missing them, so a wrong install is a startup error
       # rather than a deployment that books zeros in silence.
-      - hummingbot @ git+https://github.com/ayj777/hummingbot.git@5dff9b51f1b8d870c7f120ad5cea922651502c06
+      - hummingbot @ git+https://github.com/ayj777/hummingbot.git@1e813e774ae0abbd8a84c95d78555db0162f7880
       - geckoterminal-py>=0.3.1
       - msgpack>=1.0.5
       - flake8

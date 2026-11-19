@@ -1,8 +1,9 @@
 """Refuse to start against a hummingbot core that predates what this API reads.
 
 ``environment.yml`` pins ``hummingbot`` to ayj777/hummingbot commit
-``5dff9b51f1b8d870c7f120ad5cea922651502c06`` (PR #10 head, not merged).
-Move the pin to the squash commit on master after that PR merges. Those
+``1e813e774ae0abbd8a84c95d78555db0162f7880`` (PR #10 head, not merged).
+That head adds ``set_entry_paused``. Move the pin to the squash commit on
+master after that PR merges. Those
 changes are not in a PyPI release yet. An image built from an older core
 comes up without the fields this API reads.
 
