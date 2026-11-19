@@ -25,6 +25,8 @@ from models.executors import (
     ReleaseRangeIcebergSlotRequest,
     ReleaseRangeIcebergSlotResponse,
     StopExecutorRequest,
+    UpdateRangeIcebergRequest,
+    UpdateRangeIcebergResponse,
     StopExecutorResponse,
 )
 from models.pagination import PaginatedResponse
@@ -118,6 +120,40 @@ async def release_range_iceberg_slot(
     except Exception as e:
         logger.error(f"Error releasing range iceberg slot: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error releasing range iceberg slot: {str(e)}")
+
+
+@router.patch("/{executor_id}/range-iceberg", response_model=UpdateRangeIcebergResponse)
+async def update_range_iceberg(
+    executor_id: str,
+    request: UpdateRangeIcebergRequest,
+    executor_service: ExecutorService = Depends(get_executor_service),
+):
+    """
+    Edit a live range iceberg in place.
+
+    The body may set any subset of total_amount, price_low, price_high,
+    take_profit, and stop_loss. Decimals are strings or numbers. An exit
+    object may set percent, price, execution, order_type, slices,
+    visible_count, interval, limit_price, price_low, and price_high.
+    Null clears that exit. Omitted keys are unchanged.
+
+    The executor must be the live in-memory range iceberg. A missing
+    executor, or one that is not a range iceberg, is 404. A parked row is
+    not changed. The executor validates the edit and queues it for the next
+    tick. Accepted edits return 200 ``{accepted, reason, executor_id}`` and
+    are stored on the row. A rejected edit returns 409 and changes nothing.
+    """
+    try:
+        result = await executor_service.update_range_iceberg_config(
+            executor_id=executor_id,
+            changes=request.changes(),
+        )
+        return UpdateRangeIcebergResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error editing range iceberg {executor_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error editing range iceberg: {str(e)}")
 
 
 @router.post("/search", response_model=PaginatedResponse)

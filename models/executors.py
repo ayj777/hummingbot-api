@@ -6,7 +6,7 @@ validation for the REST API.
 """
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
@@ -358,6 +358,57 @@ class ReleaseRangeIcebergSlotResponse(BaseModel):
             "Its exchange stop is refused until the parked stop is gone."
         ),
     )
+
+
+_EDIT_NUMBER = Union[str, int, float, Decimal]
+
+
+class RangeIcebergExitEdit(BaseModel):
+    """One take-profit or stop-loss object on a range iceberg edit."""
+    model_config = ConfigDict(extra="forbid")
+    percent: Optional[_EDIT_NUMBER] = None
+    price: Optional[_EDIT_NUMBER] = None
+    execution: Optional[str] = None
+    order_type: Optional[str] = None
+    slices: Optional[int] = None
+    visible_count: Optional[int] = None
+    interval: Optional[_EDIT_NUMBER] = None
+    limit_price: Optional[_EDIT_NUMBER] = None
+    price_low: Optional[_EDIT_NUMBER] = None
+    price_high: Optional[_EDIT_NUMBER] = None
+
+
+class UpdateRangeIcebergRequest(BaseModel):
+    """In-place edit of a live range iceberg. Omitted keys are left alone.
+
+    ``take_profit`` or ``stop_loss`` set to null clears that exit.
+    """
+    model_config = ConfigDict(extra="forbid")
+    total_amount: Optional[_EDIT_NUMBER] = None
+    price_low: Optional[_EDIT_NUMBER] = None
+    price_high: Optional[_EDIT_NUMBER] = None
+    take_profit: Optional[RangeIcebergExitEdit] = None
+    stop_loss: Optional[RangeIcebergExitEdit] = None
+
+    def changes(self) -> Dict[str, Any]:
+        """Only the keys the caller sent, including an explicit null."""
+        payload: Dict[str, Any] = {}
+        for key in ("total_amount", "price_low", "price_high", "take_profit", "stop_loss"):
+            if key not in self.model_fields_set:
+                continue
+            value = getattr(self, key)
+            if isinstance(value, BaseModel):
+                payload[key] = value.model_dump(exclude_unset=True)
+            else:
+                payload[key] = value
+        return payload
+
+
+class UpdateRangeIcebergResponse(BaseModel):
+    """An accepted range iceberg edit."""
+    accepted: bool
+    reason: str
+    executor_id: str
 
 
 class ExecutorFilterRequest(PaginationParams):

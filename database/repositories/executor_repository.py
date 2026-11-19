@@ -73,7 +73,8 @@ class ExecutorRepository:
             cum_fees_quote: Optional[Decimal] = None,
             filled_amount_quote: Optional[Decimal] = None,
             final_state: Optional[str] = None,
-            error_log: Optional[str] = None
+            error_log: Optional[str] = None,
+            config: Optional[str] = None,
     ) -> Optional[ExecutorRecord]:
         """Update an executor record."""
         stmt = select(ExecutorRecord).where(ExecutorRecord.executor_id == executor_id)
@@ -98,6 +99,8 @@ class ExecutorRepository:
                 executor.final_state = final_state
             if error_log is not None:
                 executor.error_log = error_log
+            if config is not None:
+                executor.config = config
 
             await self.session.flush()
             await self.session.refresh(executor)

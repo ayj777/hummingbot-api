@@ -257,6 +257,48 @@ def _normalize_trading_pair(value: Any) -> str:
     return str(value or "").strip().upper().replace("_", "-").replace("/", "-")
 
 
+_RANGE_ICEBERG_EDIT_KEYS = (
+    "total_amount",
+    "price_low",
+    "price_high",
+    "take_profit",
+    "stop_loss",
+)
+
+
+def _json_edit_value(value: Any) -> Any:
+    """A config edit stored as JSON text.
+
+    Numbers become decimal strings so a restart reads the same value the
+    executor accepted. Nested exit objects are copied the same way. Null
+    stays null and clears that exit.
+    """
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, float):
+        return format(Decimal(str(value)), "f")
+    if isinstance(value, dict):
+        return {str(key): _json_edit_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_edit_value(item) for item in value]
+    return value
+
+
+def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
+    """Edited range iceberg fields carried in custom_info.
+
+    ``config_edits`` is the accepted edit. When that object is absent, the
+    same keys on custom_info itself are used. Either one wins over the
+    original saved config.
+    """
+    if not isinstance(custom, dict):
+        return {}
+    source = custom.get("config_edits")
+    if not isinstance(source, dict):
+        source = custom
+    return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
+
+
 _RELEASE_LEAVES_THE_POSITION = (
     "Release does not close the position or cancel the parked exchange stop. "
     "A new same-side executor runs on the software stop loss only. "
@@ -504,6 +546,10 @@ def _exit_only_custom_info(
     if "exchange_stop_released" in custom or "exchange_stop_released" in exit_blob:
         payload["exchange_stop_released"] = released
         payload["exit"]["exchange_stop_released"] = released
+    edited = _range_iceberg_edit_overlay(custom)
+    payload.update(edited)
+    if "total_amount" in edited:
+        payload["target_amount"] = edited["total_amount"]
     return payload
 
 
@@ -746,6 +792,9 @@ class ExecutorService:
         # The lock is per process. A single uvicorn worker is assumed.
         # Another worker has its own dict and would not share this lock.
         self._range_iceberg_slot_locks: Dict[tuple, asyncio.Lock] = {}
+        # One lock per executor so two config edits cannot interleave.
+        # Per process only. A single uvicorn worker is assumed.
+        self._range_iceberg_edit_locks: Dict[str, asyncio.Lock] = {}
 
     def start(self):
         """Start the executor service control loop."""
@@ -1169,10 +1218,17 @@ class ExecutorService:
         # be read as quote and place a much larger new entry. resume_entries
         # false is the same instruction on the config the executor reads.
         open_base = _reported_decimal(None, custom, "open_base")
+        edited = _range_iceberg_edit_overlay(custom)
         if open_base is not None:
-            config["total_amount"] = format(open_base, "f")
+            # An accepted edit's total_amount wins over the open base. Without
+            # an edit, the open base is the size so a QUOTE config is not
+            # resumed as a new quote order.
+            if "total_amount" not in edited:
+                config["total_amount"] = format(open_base, "f")
             config["size_unit"] = "BASE"
             config[_RESUME_ENTRIES] = False
+        for key, value in edited.items():
+            config[key] = value
         config.setdefault("controller_id", item["controller_id"])
         if item.get("connector_name"):
             config.setdefault("connector_name", item["connector_name"])
@@ -2856,6 +2912,21 @@ class ExecutorService:
 
         return executor_id, executor
 
+    def _range_iceberg_edit_lock(self, executor_id: str) -> asyncio.Lock:
+        """The lock for edits of one range iceberg.
+
+        Per process only. A single uvicorn worker is assumed.
+        """
+        locks = getattr(self, "_range_iceberg_edit_locks", None)
+        if locks is None:
+            locks = {}
+            self._range_iceberg_edit_locks = locks
+        lock = locks.get(executor_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[executor_id] = lock
+        return lock
+
     def _range_iceberg_slot_lock(self, slot: tuple) -> asyncio.Lock:
         """The lock for one account, connector, pair, and side.
 
@@ -3159,6 +3230,134 @@ class ExecutorService:
             f"This range iceberg will resume on restart (executor {executor_id}). "
             "Stop it first."
         )
+
+    async def update_range_iceberg_config(
+        self,
+        executor_id: str,
+        changes: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply an in-place edit to a live range iceberg.
+
+        Only an executor that is in memory is edited. A parked database row
+        is left alone. An accepted edit is written onto the saved config so
+        a restart resumes the edited values.
+        """
+        if not isinstance(changes, dict):
+            raise HTTPException(status_code=400, detail="changes must be an object")
+        async with self._range_iceberg_edit_lock(executor_id):
+            executor = self._active_executors.get(executor_id)
+            if executor is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {executor_id} not found",
+                )
+            metadata = self._executor_metadata.get(executor_id, {})
+            kind = metadata.get("executor_type")
+            if kind in (None, ""):
+                kind = getattr(getattr(executor, "config", None), "type", None)
+            if kind != "range_iceberg_executor":
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {executor_id} is not a range iceberg",
+                )
+            editor = getattr(executor, "update_config", None)
+            if not callable(editor):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": "the executor cannot apply a config edit",
+                        "executor_id": executor_id,
+                    },
+                )
+            try:
+                result = editor(changes)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception as exc:
+                logger.error("Range iceberg edit failed for %s: %s", executor_id, exc)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": str(exc),
+                        "executor_id": executor_id,
+                    },
+                )
+            if not isinstance(result, dict):
+                result = {}
+            accepted = bool(result.get("accepted"))
+            reason = "" if result.get("reason") in (None, "") else str(result.get("reason"))
+            if not accepted:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": reason,
+                        "executor_id": executor_id,
+                    },
+                )
+            if changes:
+                await self._persist_range_iceberg_edit(executor_id, changes)
+        return {
+            "accepted": True,
+            "reason": reason,
+            "executor_id": executor_id,
+        }
+
+    async def _persist_range_iceberg_edit(
+        self,
+        executor_id: str,
+        changes: Dict[str, Any],
+    ) -> None:
+        """Write an accepted edit onto the saved config and custom_info."""
+        metadata = self._executor_metadata.setdefault(executor_id, {})
+        config = metadata.get("config")
+        if not isinstance(config, dict):
+            config = {}
+        config = dict(config)
+        stored = {key: _json_edit_value(value) for key, value in changes.items()}
+        config.update(stored)
+        metadata["config"] = config
+        if not getattr(self, "db_manager", None):
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                if record is None:
+                    logger.error("No executor row to store the edit for %s", executor_id)
+                    return
+                final = _parse_stored_custom_info(record.final_state)
+                final.update(stored)
+                if "total_amount" in stored:
+                    final["target_amount"] = stored["total_amount"]
+                edits = final.get("config_edits")
+                if not isinstance(edits, dict):
+                    edits = {}
+                edits.update(stored)
+                final["config_edits"] = edits
+                saved_config = dict(config)
+                if record.config:
+                    try:
+                        parsed = json.loads(record.config)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        saved_config = parsed
+                        saved_config.update(stored)
+                await repo.update_executor(
+                    executor_id,
+                    config=json.dumps(saved_config, default=_json_default),
+                    final_state=json.dumps(final, default=_json_default),
+                )
+            metadata["config"] = saved_config
+        except Exception as exc:
+            logger.error(
+                "Could not persist range iceberg edit for %s: %s",
+                executor_id,
+                exc,
+            )
 
     async def create_executor(
         self,

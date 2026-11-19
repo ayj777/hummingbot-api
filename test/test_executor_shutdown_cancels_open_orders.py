@@ -1975,9 +1975,24 @@ class _OpenExecutor:
         self.status = SimpleNamespace(name="RUNNING")
         self.close_type = None
         self._kept = None
+        self.applied = {}
+        self.reject_edit = None
+        self.edit_calls = 0
 
     def start(self):
         return None
+
+    def update_config(self, changes):
+        self.edit_calls += 1
+        if self.reject_edit:
+            return {"accepted": False, "reason": self.reject_edit}
+        unknown = [key for key in changes if key not in {
+            "total_amount", "price_low", "price_high", "take_profit", "stop_loss",
+        }]
+        if unknown:
+            return {"accepted": False, "reason": f"unsupported config field: {', '.join(sorted(unknown))}"}
+        self.applied.update(changes)
+        return {"accepted": True, "reason": ""}
 
     def early_stop(self, keep_position=False):
         self.is_closed = True
@@ -2476,3 +2491,170 @@ async def test_unreadable_target_position_is_not_flat(db):
     connector.account_positions["p"]["amount"] = "0"
     created = await service.create_executor(_open_config("BUY"), account_name="master")
     assert created["executor_id"] != "hold-bad"
+
+
+@pytest.mark.asyncio
+async def test_accepted_range_iceberg_edit_survives_resume(db):
+    from routers.executors import update_range_iceberg
+    from models.executors import UpdateRangeIcebergRequest
+
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    body = UpdateRangeIcebergRequest(
+        total_amount="3",
+        price_low="90",
+        price_high="110",
+        take_profit={"percent": "0.02", "execution": "MARKET"},
+        stop_loss=None,
+    )
+    result = await update_range_iceberg(executor_id, body, executor_service=service)
+    assert result.accepted is True
+    assert result.reason == ""
+    assert result.executor_id == executor_id
+
+    rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
+    saved = json.loads(rows[0].config)
+    assert saved["total_amount"] == "3"
+    assert saved["price_low"] == "90"
+    assert saved["price_high"] == "110"
+    assert saved["take_profit"] == {"percent": "0.02", "execution": "MARKET"}
+    assert saved["stop_loss"] is None
+    assert saved["side"] == "BUY"
+    state = json.loads(rows[0].final_state)
+    assert state["target_amount"] == "3"
+    assert state["config_edits"]["total_amount"] == "3"
+    assert state["config_edits"]["stop_loss"] is None
+
+    state["resume_on_startup"] = True
+    state["exit_state"] = "RESTING"
+    state["open_base"] = "1"
+    state["side"] = "BUY"
+    state["exchange_stop_order_id"] = "stop-kept"
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            executor_id, final_state=json.dumps(state)
+        )
+    service._active_executors.pop(executor_id, None)
+    service._executor_metadata.pop(executor_id, None)
+    _install_resume_factory(service)
+    connector = _position_connector("1")
+    _use_book(service, connector)
+    await service.cleanup_orphaned_executors()
+    resumed = service._active_executors[executor_id]
+    assert resumed.config.total_amount == "3"
+    assert resumed.config.price_low == "90"
+    assert resumed.config.price_high == "110"
+    assert resumed.config.take_profit == {"percent": "0.02", "execution": "MARKET"}
+    assert resumed.config.stop_loss is None
+    assert resumed.config.size_unit == "BASE"
+    assert resumed.config.resume_entries is False
+    assert resumed.restored["total_amount"] == "3"
+    assert resumed.restored["target_amount"] == "3"
+    assert resumed.restored["price_low"] == "90"
+    assert resumed.restored["price_high"] == "110"
+    assert resumed.restored["take_profit"]["percent"] == "0.02"
+    assert resumed.restored["stop_loss"] is None
+    assert resumed.restored["open_base"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_rejected_range_iceberg_edit_changes_nothing(db):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    before = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    before_config = before.config
+    before_state = before.final_state
+    service._active_executors[executor_id].reject_edit = "a stop loss close is in progress"
+    with pytest.raises(HTTPException) as caught:
+        await service.update_range_iceberg_config(executor_id, {"total_amount": "9"})
+    assert caught.value.status_code == 409
+    assert caught.value.detail["accepted"] is False
+    assert caught.value.detail["reason"] == "a stop loss close is in progress"
+    assert caught.value.detail["executor_id"] == executor_id
+    after = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    assert after.config == before_config
+    assert after.final_state == before_state
+    assert service._active_executors[executor_id].applied == {}
+
+
+@pytest.mark.asyncio
+async def test_range_iceberg_edit_404_does_not_touch_a_parked_row(db):
+    await _seed_iceberg_row(
+        db,
+        "parked-only",
+        {"side": "BUY", "resume_on_startup": True, "open_base": "1", "exit_state": "RESTING"},
+    )
+    before = [row for row in db.query(ExecutorRecord) if row.executor_id == "parked-only"][0]
+    service = _open_service(db)
+    with pytest.raises(HTTPException) as missing:
+        await service.update_range_iceberg_config("missing", {"total_amount": "2"})
+    assert missing.value.status_code == 404
+    assert missing.value.detail == "Executor missing not found"
+
+    service._active_executors["other"] = SimpleNamespace()
+    service._executor_metadata["other"] = {"executor_type": "position_executor"}
+    with pytest.raises(HTTPException) as wrong_type:
+        await service.update_range_iceberg_config("other", {"total_amount": "2"})
+    assert wrong_type.value.status_code == 404
+    assert wrong_type.value.detail == "Executor other is not a range iceberg"
+
+    with pytest.raises(HTTPException) as parked:
+        await service.update_range_iceberg_config("parked-only", {"total_amount": "4"})
+    assert parked.value.status_code == 404
+    after = [row for row in db.query(ExecutorRecord) if row.executor_id == "parked-only"][0]
+    assert after.config == before.config
+    assert after.final_state == before.final_state
+
+
+@pytest.mark.asyncio
+async def test_concurrent_range_iceberg_edits_do_not_interleave(db):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    executor = service._active_executors[executor_id]
+    executor.inside = False
+    executor.overlapped = False
+
+    async def update_config(changes):
+        if executor.inside:
+            executor.overlapped = True
+        executor.inside = True
+        await asyncio.sleep(0.05)
+        executor.inside = False
+        executor.applied.update(changes)
+        return {"accepted": True, "reason": ""}
+
+    executor.update_config = update_config
+    first, second = await asyncio.gather(
+        service.update_range_iceberg_config(executor_id, {"total_amount": "4"}),
+        service.update_range_iceberg_config(executor_id, {"price_low": "80", "price_high": "120"}),
+    )
+    assert first["accepted"] is True
+    assert second["accepted"] is True
+    assert executor.overlapped is False
+    saved = json.loads(
+        [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0].config
+    )
+    assert saved["total_amount"] == "4"
+    assert saved["price_low"] == "80"
+    assert saved["price_high"] == "120"
+
+
+@pytest.mark.asyncio
+async def test_editing_a_range_iceberg_does_not_free_its_slot(db):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.update_range_iceberg_config(
+        executor_id,
+        {"total_amount": "2", "price_low": "10", "price_high": "20"},
+    )
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert executor_id in caught.value.detail
+    other = await service.create_executor(_open_config("SELL"), account_name="master")
+    assert other["executor_id"] != executor_id
+    assert executor_id in service._active_executors
