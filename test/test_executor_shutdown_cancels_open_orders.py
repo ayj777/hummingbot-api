@@ -1974,11 +1974,26 @@ class _OpenExecutor:
         self.is_closed = False
         self.status = SimpleNamespace(name="RUNNING")
         self.close_type = None
+        self._kept = None
 
     def start(self):
         return None
 
+    def early_stop(self, keep_position=False):
+        self.is_closed = True
+        self.status = SimpleNamespace(name="TERMINATED")
+        name = "POSITION_HOLD" if keep_position else "EARLY_STOP"
+        self.close_type = SimpleNamespace(name=name)
+        if keep_position:
+            self._kept = {
+                "side": getattr(self.config, "side", "BUY"),
+                "open_base": "1",
+                "exchange_stop_order_id": "stop-kept",
+            }
+
     def get_custom_info(self):
+        if self._kept is not None:
+            return dict(self._kept)
         return {"side": getattr(self.config, "side", "BUY")}
 
 
@@ -1994,6 +2009,7 @@ def _open_service(db):
         return None
 
     service._prepare_market = _prepare
+    service._log_capture.get_error_count.return_value = 0
     return service
 
 
@@ -2026,7 +2042,8 @@ async def test_second_long_is_rejected_including_a_parked_executor(db):
         await service.create_executor(_open_config("BUY"), account_name="master")
     assert caught.value.status_code == 409
     assert caught.value.detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master. Close it first."
+        "A range iceberg is already open on BTC-USDT BUY for master "
+        "(executor parked-long). Close it first."
     )
 
 
@@ -2077,7 +2094,260 @@ async def test_concurrent_range_iceberg_creates_only_one_succeeds(db):
     assert len(rejected) == 1
     assert rejected[0].status_code == 409
     assert rejected[0].detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master. Close it first."
+        "A range iceberg is already open on BTC-USDT BUY for master "
+        f"(executor {created[0]['executor_id']}). Close it first."
     )
     rows = [row for row in db.query(ExecutorRecord) if row.trading_pair == "BTC-USDT" and row.status == "RUNNING"]
     assert len(rows) == 1
+
+
+def _position_connector(amount, stop_ids=None):
+    connector = _Connector()
+    connector.account_positions = {
+        "p": {
+            "trading_pair": "BTC-USDT",
+            "position_side": "LONG",
+            "amount": amount,
+            "entry_price": "1",
+        }
+    }
+    for stop_id in stop_ids or []:
+        connector.in_flight_orders[stop_id] = object()
+    return connector
+
+
+def _use_book(service, connector):
+    books = {"master": {"mexc_perpetual": connector}}
+
+    def get_account_connectors(account_name):
+        return books.get(account_name, {})
+
+    service._trading_service.connector_service.get_account_connectors = get_account_connectors
+
+
+async def _park_kept_position(service, db):
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.stop_executor(executor_id, keep_position=True)
+    await service._handle_executor_completion(executor_id)
+    rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
+    assert len(rows) == 1
+    assert rows[0].status == "TERMINATED"
+    assert rows[0].close_type == "POSITION_HOLD"
+    return executor_id
+
+
+@pytest.mark.asyncio
+async def test_keep_position_still_holds_the_slot(db):
+    service = _open_service(db)
+    parked = await _park_kept_position(service, db)
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert caught.value.detail == (
+        "A range iceberg is already open on BTC-USDT BUY for master "
+        f"(executor {parked}). Close it first."
+    )
+
+
+@pytest.mark.asyncio
+async def test_flat_position_frees_a_position_hold_slot(db):
+    service = _open_service(db)
+    parked = await _park_kept_position(service, db)
+    _use_book(service, _position_connector("0", ["stop-kept"]))
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != parked
+
+
+@pytest.mark.asyncio
+async def test_release_slot_lets_a_new_range_iceberg_start(db):
+    from models.executors import ReleaseRangeIcebergSlotRequest
+    from routers.executors import release_range_iceberg_slot
+
+    service = _open_service(db)
+    with pytest.raises(HTTPException) as missing:
+        await service.release_range_iceberg_slot(
+            "master", "mexc_perpetual", "BTC-USDT", "BUY"
+        )
+    assert missing.value.status_code == 404
+
+    parked = await _park_kept_position(service, db)
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert parked in caught.value.detail
+
+    released = await release_range_iceberg_slot(
+        ReleaseRangeIcebergSlotRequest(
+            account_name="master",
+            connector_name="mexc_perpetual",
+            trading_pair="btc_usdt",
+            side="LONG",
+            executor_id=parked,
+        ),
+        executor_service=service,
+    )
+    assert released.executor_id == parked
+    assert released.released is True
+    assert released.trading_pair == "BTC-USDT"
+    assert released.side == "BUY"
+    stored = [row for row in db.query(ExecutorRecord) if row.executor_id == parked]
+    assert json.loads(stored[0].final_state)["slot_released"] is True
+
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != parked
+    with pytest.raises(HTTPException) as gone:
+        await service.release_range_iceberg_slot(
+            "master", "mexc_perpetual", "BTC-USDT", "BUY", executor_id=parked
+        )
+    assert gone.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_stale_running_flat_with_no_live_stop_does_not_block(db):
+    await _seed_iceberg_row(
+        db,
+        "stale-flat",
+        {
+            "side": "BUY",
+            "open_base": "0",
+            "exchange_stop_order_id": "stop-gone",
+        },
+    )
+    service = _open_service(db)
+    _use_book(service, _position_connector("0"))
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "stale-flat"
+
+
+@pytest.mark.asyncio
+async def test_stale_running_blocks_when_the_position_or_stop_is_live(db):
+    await _seed_iceberg_row(db, "stale-open", {"side": "BUY", "open_base": "1"})
+    service = _open_service(db)
+    _use_book(service, _position_connector("1"))
+    with pytest.raises(HTTPException) as open_position:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert open_position.value.status_code == 409
+    assert open_position.value.detail == (
+        "A range iceberg is already open on BTC-USDT BUY for master "
+        "(executor stale-open). Close it first."
+    )
+
+    await _seed_iceberg_row(
+        db,
+        "stale-stop",
+        {"side": "SELL", "open_base": "0", "exchange_stop_order_id": "stop-stale"},
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "SELL",
+        },
+    )
+    short_book = _position_connector("0", ["stop-stale"])
+    short_book.account_positions["p"]["position_side"] = "SHORT"
+    short_book.account_positions["p"]["amount"] = "0"
+    _use_book(service, short_book)
+    with pytest.raises(HTTPException) as live_stop:
+        await service.create_executor(_open_config("SELL"), account_name="master")
+    assert live_stop.value.status_code == 409
+    assert "executor stale-stop" in live_stop.value.detail
+
+
+@pytest.mark.asyncio
+async def test_stale_running_blocks_when_the_book_cannot_be_read(db):
+    await _seed_iceberg_row(db, "stale-unread", {"side": "BUY", "open_base": "0"})
+    service = _open_service(db)
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert "executor stale-unread" in caught.value.detail
+
+
+@pytest.mark.asyncio
+async def test_position_hold_without_base_or_stop_does_not_hold_the_slot(db):
+    service = _open_service(db)
+    first = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor = service._active_executors[first["executor_id"]]
+    executor.early_stop(keep_position=True)
+    executor._kept = {"side": "BUY", "open_base": "0"}
+    await service._handle_executor_completion(first["executor_id"])
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != first["executor_id"]
+
+
+@pytest.mark.asyncio
+async def test_trading_pair_case_and_separators_share_one_slot(db):
+    service = _open_service(db)
+    first = await service.create_executor(_open_config("BUY", pair="BTC-USDT"), account_name="master")
+    for pair in ("btc-usdt", "btc_usdt", "btc/usdt"):
+        with pytest.raises(HTTPException) as caught:
+            await service.create_executor(_open_config("BUY", pair=pair), account_name="master")
+        assert caught.value.status_code == 409
+        assert caught.value.detail == (
+            "A range iceberg is already open on BTC-USDT BUY for master "
+            f"(executor {first['executor_id']}). Close it first."
+        )
+    service._active_executors.pop(first["executor_id"], None)
+    with pytest.raises(HTTPException) as stored:
+        await service.create_executor(_open_config("BUY", pair="btc_usdt"), account_name="master")
+    assert stored.value.status_code == 409
+    assert first["executor_id"] in stored.value.detail
+
+
+class _FailingSession:
+    async def __aenter__(self):
+        raise RuntimeError("completion write failed")
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_completion_write_retries_once(db, caplog):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    executor = service._active_executors[executor_id]
+    executor.status = SimpleNamespace(name="TERMINATED")
+    executor.close_type = SimpleNamespace(name="EARLY_STOP")
+    real_context = service.db_manager.get_session_context
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return _FailingSession()
+        return real_context()
+
+    service.db_manager.get_session_context = flaky
+    with caplog.at_level(logging.ERROR):
+        await service._handle_executor_completion(executor_id)
+    assert attempts["n"] == 2
+    assert "attempt 1 of 2" in caplog.text
+    assert "failed after one retry" not in caplog.text
+    rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
+    assert rows[0].status == "TERMINATED"
+    assert rows[0].close_type == "EARLY_STOP"
+
+
+@pytest.mark.asyncio
+async def test_completion_write_logs_when_the_retry_also_fails(db, caplog):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    executor = service._active_executors[executor_id]
+    executor.status = SimpleNamespace(name="TERMINATED")
+    executor.close_type = SimpleNamespace(name="EARLY_STOP")
+
+    def always_fail():
+        return _FailingSession()
+
+    service.db_manager.get_session_context = always_fail
+    with caplog.at_level(logging.ERROR):
+        await service._handle_executor_completion(executor_id)
+    assert "attempt 1 of 2" in caplog.text
+    assert "attempt 2 of 2" in caplog.text
+    assert "failed after one retry" in caplog.text
+    assert "The row may still be RUNNING." in caplog.text
+    rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
+    assert rows[0].status == "RUNNING"

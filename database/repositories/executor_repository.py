@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -262,19 +262,25 @@ class ExecutorRepository:
             executor_type: str,
             account_name: str,
             connector_name: str,
-            trading_pair: str,
     ) -> List[ExecutorRecord]:
-        """Executors on this pair that have not terminated.
+        """Slot candidates for this account and connector.
 
-        RUNNING covers a parked range iceberg that still holds a position.
-        Any other non-terminal status blocks a new one on the same slot too.
+        A non-terminated row still holds a slot. A TERMINATED row closed
+        POSITION_HOLD can too, while the parked position or its exchange
+        stop is still there. The caller matches the pair after normalizing
+        it, so ``btc-usdt`` and ``BTC-USDT`` are the same slot.
         """
         stmt = select(ExecutorRecord).where(
             ExecutorRecord.executor_type == executor_type,
             ExecutorRecord.account_name == account_name,
             ExecutorRecord.connector_name == connector_name,
-            ExecutorRecord.trading_pair == trading_pair,
-            ExecutorRecord.status != "TERMINATED",
+            or_(
+                ExecutorRecord.status != "TERMINATED",
+                and_(
+                    ExecutorRecord.status == "TERMINATED",
+                    ExecutorRecord.close_type == "POSITION_HOLD",
+                ),
+            ),
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

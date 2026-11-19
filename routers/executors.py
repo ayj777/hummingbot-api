@@ -22,6 +22,8 @@ from models.executors import (
     PerformanceReportResponse,
     PositionHoldResponse,
     PositionsSummaryResponse,
+    ReleaseRangeIcebergSlotRequest,
+    ReleaseRangeIcebergSlotResponse,
     StopExecutorRequest,
     StopExecutorResponse,
 )
@@ -62,8 +64,12 @@ async def create_executor(
     Returns the created executor ID and initial status.
 
     A second range iceberg on the same account, connector, trading pair, and
-    side is rejected with 409. A long and a short on the same pair are both
-    allowed, and so is the same side on a different account.
+    side is rejected with 409. The detail names the executor that holds the
+    slot. A stop that keeps the position still holds the slot until the
+    exchange position is flat or POST /executors/range-iceberg/release-slot
+    marks it released. A long and a short on the same pair are both allowed,
+    and so is the same side on a different account. The pair match ignores
+    case and treats '_' and '/' as '-'.
     """
     try:
         result = await executor_service.create_executor(
@@ -77,6 +83,38 @@ async def create_executor(
     except Exception as e:
         logger.error(f"Error creating executor: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error creating executor: {str(e)}")
+
+
+@router.post(
+    "/range-iceberg/release-slot",
+    response_model=ReleaseRangeIcebergSlotResponse,
+)
+async def release_range_iceberg_slot(
+    request: ReleaseRangeIcebergSlotRequest,
+    executor_service: ExecutorService = Depends(get_executor_service),
+):
+    """
+    Release a parked range iceberg slot so a new executor can start on it.
+
+    A stop with keep_position leaves the row TERMINATED and POSITION_HOLD.
+    That row keeps the slot while the position or its exchange stop is still
+    there, until the exchange position is flat. This marks the occupant
+    released. It does not close the position or cancel the stop.
+    """
+    try:
+        result = await executor_service.release_range_iceberg_slot(
+            account_name=request.account_name,
+            connector_name=request.connector_name,
+            trading_pair=request.trading_pair,
+            side=request.side,
+            executor_id=request.executor_id,
+        )
+        return ReleaseRangeIcebergSlotResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error releasing range iceberg slot: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error releasing range iceberg slot: {str(e)}")
 
 
 @router.post("/search", response_model=PaginatedResponse)

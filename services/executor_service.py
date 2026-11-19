@@ -248,6 +248,15 @@ def _range_iceberg_side_name(value: Any) -> str:
     return "BUY"
 
 
+def _normalize_trading_pair(value: Any) -> str:
+    """Upper case, with '_' and '/' written as '-'.
+
+    ``btc-usdt``, ``btc_usdt`` and ``BTC/USDT`` are one pair. An empty
+    value stays empty.
+    """
+    return str(value or "").strip().upper().replace("_", "-").replace("/", "-")
+
+
 def _open_base_is_zero(custom_info: Any) -> bool:
     """True when ``open_base`` is present and zero.
 
@@ -300,6 +309,16 @@ def range_iceberg_held_base(executor: Any, custom_info: Any) -> Optional[Decimal
     if filled is not None:
         return filled if filled > 0 else Decimal("0")
     return None
+
+
+def _stored_position_hold_keeps_slot(custom_info: Any) -> bool:
+    """A parked hold still has base, or it still names an exchange stop."""
+    if not isinstance(custom_info, dict):
+        return False
+    held = range_iceberg_held_base(None, custom_info)
+    if held is not None and held > 0:
+        return True
+    return bool(_exchange_stop_ids(custom_info))
 
 
 def range_iceberg_held_quote(executor: Any, custom_info: Any, held_base: Optional[Decimal]) -> Optional[Decimal]:
@@ -717,6 +736,8 @@ class ExecutorService:
 
         # One lock per (account, connector, pair, side) so two creates of a
         # range iceberg on that slot cannot both pass the open check.
+        # The lock is per process. A single uvicorn worker is assumed.
+        # Another worker has its own dict and would not share this lock.
         self._range_iceberg_slot_locks: Dict[tuple, asyncio.Lock] = {}
 
     def start(self):
@@ -1252,7 +1273,7 @@ class ExecutorService:
         entry_notional = Decimal("0")
         for position in book.values():
             pair = position.get("trading_pair") if isinstance(position, dict) else getattr(position, "trading_pair", None)
-            if pair != trading_pair:
+            if _normalize_trading_pair(pair) != _normalize_trading_pair(trading_pair):
                 continue
             raw_side = position.get("position_side") if isinstance(position, dict) else getattr(position, "position_side", None)
             side_text = getattr(raw_side, "name", raw_side)
@@ -2790,7 +2811,10 @@ class ExecutorService:
         return executor_id, executor
 
     def _range_iceberg_slot_lock(self, slot: tuple) -> asyncio.Lock:
-        """The lock for one account, connector, pair, and side."""
+        """The lock for one account, connector, pair, and side.
+
+        Per process only. A single uvicorn worker is assumed.
+        """
         locks = getattr(self, "_range_iceberg_slot_locks", None)
         if locks is None:
             locks = {}
@@ -2829,7 +2853,7 @@ class ExecutorService:
                 continue
             if (meta.get("connector_name") or "") != connector:
                 continue
-            if (meta.get("trading_pair") or "") != pair:
+            if _normalize_trading_pair(meta.get("trading_pair") or "") != pair:
                 continue
             config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
             stored_side = config.get("side")
@@ -2842,37 +2866,217 @@ class ExecutorService:
                 return executor_id
         return None
 
+    def _executor_id_is_live(self, executor_id: str) -> bool:
+        executor = self._active_executors.get(executor_id)
+        return executor is not None and not self._executor_is_closed(executor)
+
+    async def _range_iceberg_slot_rows(self, slot: tuple) -> List[tuple]:
+        """Stored candidates on this slot.
+
+        Columns are copied before the session closes. A later read of a
+        detached row cannot see status, close_type, config, or final_state.
+        The pair is matched after normalization.
+        """
+        if not getattr(self, "db_manager", None):
+            return []
+        account, connector, pair, side = slot
+        stored: List[tuple] = []
+        async with self.db_manager.get_session_context() as session:
+            records = await ExecutorRepository(session).get_open_executors_for_pair(
+                "range_iceberg_executor", account, connector
+            )
+            for record in records:
+                stored.append((
+                    record.executor_id,
+                    record.status,
+                    record.close_type,
+                    record.trading_pair,
+                    record.config,
+                    record.final_state,
+                ))
+        matched: List[tuple] = []
+        for row in stored:
+            if _normalize_trading_pair(row[3] or "") != pair:
+                continue
+            if self._range_iceberg_side_of_stored(row[4], row[5]) != side:
+                continue
+            matched.append(row)
+        return matched
+
+    async def _exchange_side_is_flat(self, slot: tuple) -> bool:
+        """True only when the position book was read and that side is flat.
+
+        An unreadable book is not flat. The slot stays occupied.
+        """
+        account, connector, pair, side = slot
+        snapshot = await self._exchange_open_base(account, connector, pair, side)
+        return snapshot is not None and snapshot[0] == 0
+
+    async def _exchange_stops_are_live(self, slot: tuple, custom_info: Any) -> bool:
+        """True when a stored stop id is still open, or cannot be checked.
+
+        No stored id means there is no live stop. A connector that cannot
+        list stops leaves the stored ids treated as live.
+        """
+        stop_ids = _exchange_stop_ids(custom_info)
+        if not stop_ids:
+            return False
+        account, connector_name, pair, _side = slot
+        connector = self._account_connector(account, connector_name)
+        lister = getattr(connector, "list_open_stop_orders", None) if connector is not None else None
+        if not callable(lister):
+            return True
+        try:
+            try:
+                listed = lister(pair)
+            except TypeError:
+                listed = lister()
+            if asyncio.iscoroutine(listed):
+                listed = await listed
+        except Exception:
+            logger.error(
+                "Could not list open stops for %s %s",
+                connector_name,
+                pair,
+                exc_info=True,
+            )
+            return True
+        rows = listed if isinstance(listed, list) else []
+        for stop_id in stop_ids:
+            if any(self._open_row_matches(row, stop_id, stop_id) for row in rows):
+                return True
+        return False
+
+    async def _stale_range_iceberg_blocks(self, slot: tuple, custom_info: Any) -> bool:
+        """A RUNNING row that is not in this process.
+
+        Flat, with no live stop, does not block. An open position, a live
+        stop, or an unreadable book does.
+        """
+        if not await self._exchange_side_is_flat(slot):
+            return True
+        return await self._exchange_stops_are_live(slot, custom_info)
+
+    def _range_iceberg_conflict(self, slot: tuple, occupant: str) -> HTTPException:
+        account, _connector, pair, side = slot
+        detail = (
+            f"A range iceberg is already open on {pair} {side} for {account} "
+            f"(executor {occupant}). Close it first."
+        )
+        logger.info("%s", detail)
+        return HTTPException(status_code=409, detail=detail)
+
     async def _assert_range_iceberg_slot_free(self, slot: tuple) -> None:
         """Reject a second open range iceberg on this account, connector, pair, and side.
 
-        A row that is not TERMINATED still holds the slot. That includes a
-        parked executor that is only in the database. A long and a short are
-        different slots, and so is the same side on another account.
+        A live executor holds the slot. So does a TERMINATED POSITION_HOLD row
+        that still has base or an exchange stop, until the exchange position
+        on that side is flat or the row is marked slot_released. A RUNNING
+        row that is not in memory holds the slot unless that side is flat and
+        has no live stop. A long and a short are different slots, and so is
+        the same side on another account.
         """
         occupant = self._range_iceberg_memory_occupant(slot)
-        if occupant is None and self.db_manager:
-            account, connector, pair, side = slot
-            # Copy the columns before the session closes. A later read of a
-            # detached row cannot see config or final_state.
-            stored: List[tuple] = []
-            async with self.db_manager.get_session_context() as session:
-                records = await ExecutorRepository(session).get_open_executors_for_pair(
-                    "range_iceberg_executor", account, connector, pair
-                )
-                for record in records:
-                    stored.append((record.executor_id, record.config, record.final_state))
-            for executor_id, config_raw, final_state in stored:
-                if self._range_iceberg_side_of_stored(config_raw, final_state) == side:
+        if occupant is None:
+            for row in await self._range_iceberg_slot_rows(slot):
+                executor_id, status, close_type, _pair, _config, final_state = row
+                if self._executor_id_is_live(executor_id):
                     occupant = executor_id
                     break
+                custom = _parse_stored_custom_info(final_state)
+                if custom.get("slot_released") is True:
+                    continue
+                if (status or "") != "TERMINATED":
+                    if await self._stale_range_iceberg_blocks(slot, custom):
+                        occupant = executor_id
+                        break
+                    continue
+                if close_type != "POSITION_HOLD":
+                    continue
+                if not _stored_position_hold_keeps_slot(custom):
+                    continue
+                if await self._exchange_side_is_flat(slot):
+                    continue
+                occupant = executor_id
+                break
         if occupant is None:
             return
-        account, _connector, pair, side = slot
-        detail = (
-            f"A range iceberg is already open on {pair} {side} for {account}. Close it first."
-        )
-        logger.info("%s Existing executor %s.", detail, occupant)
-        raise HTTPException(status_code=409, detail=detail)
+        raise self._range_iceberg_conflict(slot, occupant)
+
+    async def release_range_iceberg_slot(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        side: str,
+        executor_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Mark a parked range iceberg released so a new one can start.
+
+        Does not close the position or cancel its exchange stop. A live
+        in-memory executor is not released.
+        """
+        pair = _normalize_trading_pair(trading_pair)
+        side_name = _range_iceberg_side_name(side)
+        slot = (account_name, connector_name or "", pair, side_name)
+        async with self._range_iceberg_slot_lock(slot):
+            rows = await self._range_iceberg_slot_rows(slot)
+            if executor_id:
+                rows = [row for row in rows if row[0] == executor_id]
+            target = None
+            for row in rows:
+                row_id, status, close_type, _pair, _config, final_state = row
+                if self._executor_id_is_live(row_id):
+                    if executor_id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Executor {row_id} is still running. "
+                                "Stop it before releasing the slot."
+                            ),
+                        )
+                    continue
+                custom = _parse_stored_custom_info(final_state)
+                if custom.get("slot_released") is True:
+                    continue
+                parked = close_type == "POSITION_HOLD" or (status or "") != "TERMINATED"
+                if not parked:
+                    continue
+                target = row
+                break
+            if target is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"No parked range iceberg on {pair} {side_name} "
+                        f"for {account_name}."
+                    ),
+                )
+            row_id = target[0]
+            custom = dict(_parse_stored_custom_info(target[5]))
+            custom["slot_released"] = True
+            if not getattr(self, "db_manager", None):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {row_id} not found",
+                )
+            async with self.db_manager.get_session_context() as session:
+                updated = await ExecutorRepository(session).update_executor(
+                    row_id,
+                    final_state=json.dumps(custom),
+                )
+            if updated is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {row_id} not found",
+                )
+        return {
+            "executor_id": row_id,
+            "released": True,
+            "trading_pair": pair,
+            "side": side_name,
+            "account_name": account_name,
+        }
 
     async def create_executor(
         self,
@@ -2892,7 +3096,9 @@ class ExecutorService:
 
         Raises:
             HTTPException: 409 when a range iceberg is already open on the same
-            account, connector, trading pair, and side
+            account, connector, trading pair, and side. The detail names that
+            executor. A parked POSITION_HOLD still holds the slot until the
+            exchange position is flat or the slot is released.
         """
         account = account_name or self.default_account
         trading_interface = self._get_trading_interface(account)
@@ -2927,7 +3133,7 @@ class ExecutorService:
             slot = (
                 account,
                 connector_name or "",
-                trading_pair or "",
+                _normalize_trading_pair(trading_pair),
                 _range_iceberg_side_name(side_value),
             )
 
@@ -2943,6 +3149,7 @@ class ExecutorService:
         else:
             # The lock covers the open check and the register, so a second
             # create on this slot waits until the first is in memory and stored.
+            # The lock is per process (single uvicorn worker).
             async with self._range_iceberg_slot_lock(slot):
                 await self._assert_range_iceberg_slot_free(slot)
                 executor_id, executor = await _register_and_persist()
@@ -3693,10 +3900,32 @@ class ExecutorService:
             logger.error(f"Error persisting executor creation: {e}")
 
     async def _persist_executor_completed(self, executor_id: str, executor: ExecutorBase):
-        """Persist executor completion to database."""
+        """Persist executor completion to database.
+
+        A failed write is logged and tried once more. Without that retry a
+        finished executor stays RUNNING and holds its slot.
+        """
         if not self.db_manager:
             return
+        for attempt in (1, 2):
+            try:
+                await self._persist_executor_completed_once(executor_id, executor)
+                return
+            except Exception as error:
+                logger.error(
+                    "Error persisting executor completion for %s (attempt %s of 2): %s",
+                    executor_id,
+                    attempt,
+                    error,
+                )
+        logger.error(
+            "Completion write for executor %s failed after one retry. "
+            "The row may still be RUNNING.",
+            executor_id,
+        )
 
+    async def _persist_executor_completed_once(self, executor_id: str, executor: ExecutorBase):
+        """One attempt to write the completion row."""
         try:
             # Read status/close_type directly from executor (most reliable)
             status_name = executor.status.name
@@ -3845,6 +4074,9 @@ class ExecutorService:
                     f"Could not persist completion for executor {executor_id}: no row to "
                     f"update and the repair insert did not take"
                 )
+                raise RuntimeError(
+                    f"completion row for executor {executor_id} was not written"
+                )
             elif repaired:
                 logger.warning(
                     f"Executor {executor_id} completed before its creation row existed; "
@@ -3853,8 +4085,8 @@ class ExecutorService:
             else:
                 logger.debug(f"Persisted executor {executor_id} completion to database")
 
-        except Exception as e:
-            logger.error(f"Error persisting executor completion: {e}")
+        except Exception:
+            raise
 
     # ========================================
     # Position Hold Tracking Methods

@@ -315,6 +315,36 @@ class StopExecutorRequest(BaseModel):
     )
 
 
+class ReleaseRangeIcebergSlotRequest(BaseModel):
+    """Release a parked range iceberg so another can start on its slot."""
+    account_name: str = Field(
+        ...,
+        description="Account that owns the parked executor"
+    )
+    connector_name: str = Field(..., description="Connector name")
+    trading_pair: str = Field(
+        ...,
+        description="Trading pair. Case and '_' or '/' separators are normalized."
+    )
+    side: str = Field(
+        ...,
+        description="BUY or SELL. LONG counts as BUY and SHORT as SELL."
+    )
+    executor_id: Optional[str] = Field(
+        None,
+        description="Parked executor to release. When omitted, the occupant of this slot is released."
+    )
+
+
+class ReleaseRangeIcebergSlotResponse(BaseModel):
+    """The parked executor whose slot was released."""
+    executor_id: str
+    released: bool
+    trading_pair: str
+    side: str
+    account_name: str
+
+
 class ExecutorFilterRequest(PaginationParams):
     """Request to filter and list executors."""
     account_names: Optional[List[str]] = Field(
