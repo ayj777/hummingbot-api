@@ -96,10 +96,13 @@ async def release_range_iceberg_slot(
     """
     Release a parked range iceberg slot so a new executor can start on it.
 
-    A stop with keep_position leaves the row TERMINATED and POSITION_HOLD.
-    That row keeps the slot while the position or its exchange stop is still
-    there, until the exchange position is flat. This marks the occupant
-    released. It does not close the position or cancel the stop.
+    Only a TERMINATED POSITION_HOLD row can be released. A row that has not
+    terminated is refused with 409, because it will resume on restart.
+
+    Release does not close the position or cancel the parked exchange stop.
+    A new same-side executor runs on the software stop loss only. Its
+    exchange stop is refused until the parked stop is gone. The response
+    body repeats that warning.
     """
     try:
         result = await executor_service.release_range_iceberg_slot(

@@ -2190,6 +2190,13 @@ async def test_release_slot_lets_a_new_range_iceberg_start(db):
     assert released.released is True
     assert released.trading_pair == "BTC-USDT"
     assert released.side == "BUY"
+    assert released.position_closed is False
+    assert released.exchange_stop_cancelled is False
+    assert released.warning == (
+        "Release does not close the position or cancel the parked exchange stop. "
+        "A new same-side executor runs on the software stop loss only. "
+        "Its exchange stop is refused until the parked stop is gone."
+    )
     stored = [row for row in db.query(ExecutorRecord) if row.executor_id == parked]
     assert json.loads(stored[0].final_state)["slot_released"] is True
 
@@ -2351,3 +2358,121 @@ async def test_completion_write_logs_when_the_retry_also_fails(db, caplog):
     assert "The row may still be RUNNING." in caplog.text
     rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
     assert rows[0].status == "RUNNING"
+
+
+async def _mark_position_hold(db, executor_id):
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            executor_id, status="TERMINATED", close_type="POSITION_HOLD"
+        )
+
+
+@pytest.mark.asyncio
+async def test_release_refuses_a_running_row_and_resume_skips_released(db):
+    await _seed_iceberg_row(
+        db,
+        "still-running",
+        {
+            "side": "BUY",
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "open_base": "1",
+        },
+    )
+    service = _open_service(db)
+    with pytest.raises(HTTPException) as unnamed:
+        await service.release_range_iceberg_slot(
+            "master", "mexc_perpetual", "BTC-USDT", "BUY"
+        )
+    assert unnamed.value.status_code == 409
+    assert unnamed.value.detail == (
+        "This range iceberg will resume on restart (executor still-running). "
+        "Stop it first."
+    )
+    with pytest.raises(HTTPException) as named:
+        await service.release_range_iceberg_slot(
+            "master",
+            "mexc_perpetual",
+            "BTC-USDT",
+            "BUY",
+            executor_id="still-running",
+        )
+    assert named.value.status_code == 409
+    stored_rows = [row for row in db.query(ExecutorRecord) if row.executor_id == "still-running"]
+    stored = json.loads(stored_rows[0].final_state)
+    assert stored.get("slot_released") is not True
+    assert stored["resume_on_startup"] is True
+
+    stored["slot_released"] = True
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            "still-running", final_state=json.dumps(stored)
+        )
+    await _seed_iceberg_row(
+        db,
+        "will-resume",
+        {
+            "side": "SELL",
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+            "open_base": "1",
+        },
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "SELL",
+        },
+    )
+    found = await service._load_resume_candidates()
+    ids = {item["executor_id"] for item in found}
+    assert "still-running" not in ids
+    assert "will-resume" in ids
+
+
+@pytest.mark.asyncio
+async def test_position_book_is_refreshed_once_per_create(db):
+    await _seed_iceberg_row(db, "hold-a", {"side": "BUY", "open_base": "1"})
+    await _seed_iceberg_row(db, "hold-b", {"side": "BUY", "open_base": "2"})
+    await _mark_position_hold(db, "hold-a")
+    await _mark_position_hold(db, "hold-b")
+    service = _open_service(db)
+    connector = _position_connector("0")
+    connector.refresh_calls = 0
+
+    async def _update_positions():
+        connector.refresh_calls += 1
+
+    connector._update_positions = _update_positions
+    _use_book(service, connector)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] not in {"hold-a", "hold-b"}
+    assert connector.refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unreadable_target_position_is_not_flat(db):
+    await _seed_iceberg_row(
+        db,
+        "hold-bad",
+        {"side": "BUY", "open_base": "1", "exchange_stop_order_id": "stop-kept"},
+    )
+    await _mark_position_hold(db, "hold-bad")
+    service = _open_service(db)
+    connector = _position_connector("1")
+    connector.account_positions["p"]["amount"] = "not-a-number"
+    connector.account_positions["other"] = {
+        "trading_pair": "ETH-USDT",
+        "position_side": "LONG",
+        "amount": "also-bad",
+        "entry_price": "1",
+    }
+    _use_book(service, connector)
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert "executor hold-bad" in caught.value.detail
+
+    connector.account_positions["p"]["amount"] = "0"
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "hold-bad"

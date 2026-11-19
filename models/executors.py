@@ -337,12 +337,27 @@ class ReleaseRangeIcebergSlotRequest(BaseModel):
 
 
 class ReleaseRangeIcebergSlotResponse(BaseModel):
-    """The parked executor whose slot was released."""
+    """The parked executor whose slot was released.
+
+    Release does not close the position or cancel the parked exchange stop.
+    A new same-side executor runs on the software stop loss only. Its
+    exchange stop is refused until the parked stop is gone.
+    """
     executor_id: str
     released: bool
     trading_pair: str
     side: str
     account_name: str
+    position_closed: bool = False
+    exchange_stop_cancelled: bool = False
+    warning: str = Field(
+        ...,
+        description=(
+            "Release does not close the position or cancel the parked exchange stop. "
+            "A new same-side executor runs on the software stop loss only. "
+            "Its exchange stop is refused until the parked stop is gone."
+        ),
+    )
 
 
 class ExecutorFilterRequest(PaginationParams):

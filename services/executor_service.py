@@ -257,6 +257,13 @@ def _normalize_trading_pair(value: Any) -> str:
     return str(value or "").strip().upper().replace("_", "-").replace("/", "-")
 
 
+_RELEASE_LEAVES_THE_POSITION = (
+    "Release does not close the position or cancel the parked exchange stop. "
+    "A new same-side executor runs on the software stop loss only. "
+    "Its exchange stop is refused until the parked stop is gone."
+)
+
+
 def _open_base_is_zero(custom_info: Any) -> bool:
     """True when ``open_base`` is present and zero.
 
@@ -1079,6 +1086,11 @@ class ExecutorService:
                 if record.executor_type != "range_iceberg_executor":
                     continue
                 custom = _parse_stored_custom_info(record.final_state)
+                # A released slot must not come back on restart beside the
+                # executor that took its place. Release itself refuses a
+                # non-terminated row. This is the second check.
+                if custom.get("slot_released") is True:
+                    continue
                 if custom.get(_RESUME_ON_STARTUP) is not True:
                     continue
                 open_order_ids = []
@@ -1233,6 +1245,59 @@ class ExecutorService:
         name = getattr(side, "name", side)
         return str(name).strip().upper() or "BUY"
 
+    @staticmethod
+    def _parse_position(
+        position: Any,
+        trading_pair: str,
+        side_name: str,
+    ) -> Optional[tuple]:
+        """One book row against this pair and side.
+
+        ``(base, entry)`` when the row is this pair and side. ``()`` when it
+        is a different pair or side. None when the row is this pair and side
+        but its size cannot be read. A None is not a flat position.
+        """
+        if isinstance(position, dict):
+            pair = position.get("trading_pair")
+            raw_side = position.get("position_side")
+            raw_amount = position.get("amount")
+            raw_entry = position.get("entry_price")
+        else:
+            pair = getattr(position, "trading_pair", None)
+            raw_side = getattr(position, "position_side", None)
+            raw_amount = getattr(position, "amount", None)
+            raw_entry = getattr(position, "entry_price", None)
+        if _normalize_trading_pair(pair) != _normalize_trading_pair(trading_pair):
+            return ()
+        side_text = getattr(raw_side, "name", raw_side)
+        side_text = side_text.strip().upper() if isinstance(side_text, str) else ""
+        want_long = side_name in {"BUY", "LONG"}
+        amount = None
+        amount_ok = False
+        if raw_amount not in (None, ""):
+            try:
+                amount = Decimal(str(raw_amount))
+                amount_ok = True
+            except Exception:
+                amount_ok = False
+        if side_text in {"LONG", "SHORT"}:
+            matches = (side_text == "LONG") == want_long
+        elif not amount_ok:
+            return None
+        elif amount == 0:
+            return ()
+        else:
+            matches = (amount > 0) == want_long
+        if not matches:
+            return ()
+        if not amount_ok:
+            return None
+        try:
+            entry_price = Decimal(str(raw_entry)) if raw_entry not in (None, "") else None
+        except Exception:
+            entry_price = None
+        return abs(amount), entry_price
+
     async def _exchange_open_base(
         self,
         account_name: str,
@@ -1242,7 +1307,8 @@ class ExecutorService:
     ) -> Optional[tuple]:
         """Absolute base and entry price on this pair and side.
 
-        None when the connector position book cannot be read. The base is zero
+        None when the connector position book cannot be read, or when a
+        position on this pair and side cannot be parsed. The base is zero
         when the book was read and that side is flat. The entry price is None
         when the book has no price. Hedge mode matches LONG to BUY and SHORT
         to SELL. A signed one-way amount uses its sign the same way.
@@ -1267,37 +1333,17 @@ class ExecutorService:
         book = getattr(connector, "account_positions", None)
         if not isinstance(book, dict):
             return None
-        want_long = side_name in {"BUY", "LONG"}
         total = Decimal("0")
         entry_base = Decimal("0")
         entry_notional = Decimal("0")
         for position in book.values():
-            pair = position.get("trading_pair") if isinstance(position, dict) else getattr(position, "trading_pair", None)
-            if _normalize_trading_pair(pair) != _normalize_trading_pair(trading_pair):
+            parsed = self._parse_position(position, trading_pair, side_name)
+            if parsed is None:
+                return None
+            if parsed == ():
                 continue
-            raw_side = position.get("position_side") if isinstance(position, dict) else getattr(position, "position_side", None)
-            side_text = getattr(raw_side, "name", raw_side)
-            side_text = side_text.strip().upper() if isinstance(side_text, str) else ""
-            raw_amount = position.get("amount") if isinstance(position, dict) else getattr(position, "amount", 0)
-            raw_entry = position.get("entry_price") if isinstance(position, dict) else getattr(position, "entry_price", None)
-            try:
-                amount = Decimal(str(raw_amount or 0))
-            except Exception:
-                continue
-            if side_text in {"LONG", "SHORT"}:
-                matches = (side_text == "LONG") == want_long
-            elif amount == 0:
-                matches = False
-            else:
-                matches = (amount > 0) == want_long
-            if not matches:
-                continue
-            base = abs(amount)
+            base, entry_price = parsed
             total += base
-            try:
-                entry_price = Decimal(str(raw_entry)) if raw_entry not in (None, "") else None
-            except Exception:
-                entry_price = None
             if entry_price is not None and entry_price > 0 and base > 0:
                 entry_base += base
                 entry_notional += entry_price * base
@@ -2906,7 +2952,8 @@ class ExecutorService:
     async def _exchange_side_is_flat(self, slot: tuple) -> bool:
         """True only when the position book was read and that side is flat.
 
-        An unreadable book is not flat. The slot stays occupied.
+        An unreadable book is not flat, and neither is a position on this
+        pair and side whose size cannot be parsed. The slot stays occupied.
         """
         account, connector, pair, side = slot
         snapshot = await self._exchange_open_base(account, connector, pair, side)
@@ -2947,13 +2994,19 @@ class ExecutorService:
                 return True
         return False
 
-    async def _stale_range_iceberg_blocks(self, slot: tuple, custom_info: Any) -> bool:
+    async def _stale_range_iceberg_blocks(
+        self,
+        slot: tuple,
+        custom_info: Any,
+        flat: bool,
+    ) -> bool:
         """A RUNNING row that is not in this process.
 
         Flat, with no live stop, does not block. An open position, a live
-        stop, or an unreadable book does.
+        stop, or an unreadable book does. ``flat`` is the one position read
+        for this create.
         """
-        if not await self._exchange_side_is_flat(slot):
+        if not flat:
             return True
         return await self._exchange_stops_are_live(slot, custom_info)
 
@@ -2978,7 +3031,20 @@ class ExecutorService:
         """
         occupant = self._range_iceberg_memory_occupant(slot)
         if occupant is None:
-            for row in await self._range_iceberg_slot_rows(slot):
+            rows = await self._range_iceberg_slot_rows(slot)
+            # One position refresh for this create, shared by every parked row.
+            flat_known = False
+            flat = False
+
+            async def side_is_flat() -> bool:
+                nonlocal flat_known, flat
+                if not flat_known:
+                    snapshot = await self._exchange_side_is_flat(slot)
+                    flat = snapshot
+                    flat_known = True
+                return flat
+
+            for row in rows:
                 executor_id, status, close_type, _pair, _config, final_state = row
                 if self._executor_id_is_live(executor_id):
                     occupant = executor_id
@@ -2987,7 +3053,7 @@ class ExecutorService:
                 if custom.get("slot_released") is True:
                     continue
                 if (status or "") != "TERMINATED":
-                    if await self._stale_range_iceberg_blocks(slot, custom):
+                    if await self._stale_range_iceberg_blocks(slot, custom, await side_is_flat()):
                         occupant = executor_id
                         break
                     continue
@@ -2995,7 +3061,7 @@ class ExecutorService:
                     continue
                 if not _stored_position_hold_keeps_slot(custom):
                     continue
-                if await self._exchange_side_is_flat(slot):
+                if await side_is_flat():
                     continue
                 occupant = executor_id
                 break
@@ -3011,10 +3077,12 @@ class ExecutorService:
         side: str,
         executor_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Mark a parked range iceberg released so a new one can start.
+        """Mark a TERMINATED POSITION_HOLD range iceberg released.
 
-        Does not close the position or cancel its exchange stop. A live
-        in-memory executor is not released.
+        Does not close the position or cancel its exchange stop. A new
+        same-side executor then runs on the software stop loss only. Its
+        exchange stop is refused until the parked stop is gone. A row that
+        has not terminated is refused, because it can resume on restart.
         """
         pair = _normalize_trading_pair(trading_pair)
         side_name = _range_iceberg_side_name(side)
@@ -3024,27 +3092,31 @@ class ExecutorService:
             if executor_id:
                 rows = [row for row in rows if row[0] == executor_id]
             target = None
+            refused_id = None
             for row in rows:
                 row_id, status, close_type, _pair, _config, final_state = row
-                if self._executor_id_is_live(row_id):
-                    if executor_id:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Executor {row_id} is still running. "
-                                "Stop it before releasing the slot."
-                            ),
-                        )
-                    continue
                 custom = _parse_stored_custom_info(final_state)
                 if custom.get("slot_released") is True:
                     continue
-                parked = close_type == "POSITION_HOLD" or (status or "") != "TERMINATED"
-                if not parked:
+                still_open = self._executor_id_is_live(row_id) or (status or "") != "TERMINATED"
+                if still_open or close_type != "POSITION_HOLD":
+                    if still_open:
+                        if executor_id:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=self._resume_on_restart_detail(row_id),
+                            )
+                        if refused_id is None:
+                            refused_id = row_id
                     continue
                 target = row
                 break
             if target is None:
+                if refused_id is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=self._resume_on_restart_detail(refused_id),
+                    )
                 raise HTTPException(
                     status_code=404,
                     detail=(
@@ -3076,7 +3148,17 @@ class ExecutorService:
             "trading_pair": pair,
             "side": side_name,
             "account_name": account_name,
+            "position_closed": False,
+            "exchange_stop_cancelled": False,
+            "warning": _RELEASE_LEAVES_THE_POSITION,
         }
+
+    @staticmethod
+    def _resume_on_restart_detail(executor_id: str) -> str:
+        return (
+            f"This range iceberg will resume on restart (executor {executor_id}). "
+            "Stop it first."
+        )
 
     async def create_executor(
         self,
