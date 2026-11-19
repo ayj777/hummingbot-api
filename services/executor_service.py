@@ -523,13 +523,27 @@ def _reported_decimal(executor: Any, custom_info: Any, key: str) -> Optional[Dec
         return None
 
 
+def _close_type_name(close_type: Any) -> str:
+    """``POSITION_CLOSED_EXTERNALLY`` from a stored string or a CloseType."""
+    if close_type is None or close_type == "":
+        return ""
+    name = getattr(close_type, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    text = str(close_type).strip()
+    if text.startswith("CloseType."):
+        return text[len("CloseType."):]
+    return text
+
+
 def _range_iceberg_externally_closed(close_type: Any, custom_info: Any) -> bool:
     """True when the exchange book was closed outside this executor.
 
     ``open_base`` can stay above zero after that close. The close type and
-    ``external_close`` are what say the position is gone.
+    ``external_close`` are what say the position is gone. A leftover
+    ``reconcile_error`` is a failed read, not a close.
     """
-    if str(close_type or "") == "POSITION_CLOSED_EXTERNALLY":
+    if _close_type_name(close_type) == "POSITION_CLOSED_EXTERNALLY":
         return True
     return isinstance(custom_info, dict) and custom_info.get("external_close") is True
 
@@ -538,13 +552,15 @@ def range_iceberg_held_base(executor: Any, custom_info: Any) -> Optional[Decimal
     """Base still held by a range iceberg.
 
     An external close holds nothing, even when ``open_base`` is still the old
-    size. Otherwise ``exchange_position_base`` is the live book and wins over
-    ``open_base``. With neither, ``open_base`` when that field is present.
+    size. The executor's close type counts even when ``external_close`` is
+    still false. Otherwise ``exchange_position_base`` is the live book and
+    wins over ``open_base``. With neither, ``open_base`` when that field is present.
     Otherwise ``filled_base`` minus ``closed_base`` when both are present.
     Otherwise ``filled_base``. None when none of those fields were reported,
     so the caller can use the generic fill.
     """
-    if _range_iceberg_externally_closed(None, custom_info):
+    close_type = getattr(executor, "close_type", None) if executor is not None else None
+    if _range_iceberg_externally_closed(close_type, custom_info):
         return Decimal("0")
     exchange = _reported_decimal(executor, custom_info, "exchange_position_base")
     if exchange is not None:
@@ -3424,6 +3440,14 @@ class ExecutorService:
             for row in rows:
                 executor_id, status, close_type, _pair, _config, final_state = row
                 if self._executor_id_is_live(executor_id):
+                    # The object can already be externally closed while its
+                    # stored row is still RUNNING and external_close is false.
+                    live = self._active_executors.get(executor_id)
+                    if _range_iceberg_externally_closed(
+                        getattr(live, "close_type", None),
+                        self._safe_custom_info(live),
+                    ):
+                        continue
                     occupant = executor_id
                     break
                 custom = _parse_stored_custom_info(final_state)

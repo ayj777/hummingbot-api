@@ -767,6 +767,31 @@ def test_range_iceberg_held_base_prefers_open_base():
         None,
         {"open_base": "5", "exchange_position_base": "0", "external_close": True},
     ) == Decimal("0")
+    # The close type is enough. A false flag and a stale book must not keep base.
+    closed = SimpleNamespace(close_type=SimpleNamespace(name="POSITION_CLOSED_EXTERNALLY"))
+    assert range_iceberg_held_base(
+        closed,
+        {
+            "open_base": "5",
+            "exchange_position_base": "5",
+            "external_close": False,
+            "reconcile_error": "position read failed: timeout",
+        },
+    ) == Decimal("0")
+    # A failed read is not a close. The last reported book still counts.
+    assert range_iceberg_held_base(
+        None,
+        {
+            "open_base": "5",
+            "exchange_position_base": "4",
+            "external_close": False,
+            "reconcile_error": "position read failed: timeout",
+        },
+    ) == Decimal("4")
+    assert range_iceberg_held_base(
+        None,
+        {"open_base": "5", "external_close": False, "reconcile_error": "position read failed: timeout"},
+    ) == Decimal("5")
 
 
 class _CancellingExecutor(_Executor):
@@ -2196,6 +2221,86 @@ async def test_external_close_does_not_keep_a_phantom_position():
     position = next(iter(service._positions_held.values()))
     assert position.buy_amount_base == 0
     assert position.executor_ids == []
+
+
+@pytest.mark.asyncio
+async def test_close_type_frees_a_running_row_when_external_close_is_false(db):
+    """The column is enough. A false flag and a stale error must not keep the slot."""
+    await _seed_iceberg_row(
+        db,
+        "typed-outside",
+        {
+            "side": "BUY",
+            "open_base": "5",
+            "exchange_position_base": "5",
+            "external_close": False,
+            "reconcile_error": "position read failed: timeout",
+            "resume_on_startup": True,
+        },
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "BUY",
+        },
+    )
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            "typed-outside",
+            status="RUNNING",
+            close_type="POSITION_CLOSED_EXTERNALLY",
+        )
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "typed-outside"
+    candidates = await service._load_resume_candidates()
+    assert [row["executor_id"] for row in candidates] == []
+
+
+@pytest.mark.asyncio
+async def test_a_live_close_type_frees_the_slot_before_the_flag_is_stored(db):
+    service = _open_service(db)
+    first = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor = service._active_executors[first["executor_id"]]
+    executor.close_type = SimpleNamespace(name="POSITION_CLOSED_EXTERNALLY")
+    executor._kept = {
+        "side": "BUY",
+        "open_base": "5",
+        "exchange_position_base": "5",
+        "external_close": False,
+        "reconcile_error": "position read failed: timeout",
+    }
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != first["executor_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_reconcile_error_does_not_free_the_slot(db):
+    """A failed position read leaves the error set while the position is still open."""
+    await _seed_iceberg_row(
+        db,
+        "stale-read",
+        {
+            "side": "BUY",
+            "open_base": "5",
+            "exchange_position_base": "5",
+            "external_close": False,
+            "reconcile_error": "position read failed: timeout",
+            "resume_on_startup": True,
+            "exit_state": "RESTING",
+        },
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "BUY",
+        },
+    )
+    service = _open_service(db)
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert "stale-read" in caught.value.detail
 
 
 @pytest.mark.asyncio
