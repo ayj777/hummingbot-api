@@ -2926,7 +2926,84 @@ def test_live_executor_response_surfaces_the_config_edit():
     shown = service._format_executor_info("live-1", executor)
     assert shown["pending_config_edit"] is True
     assert shown["config_edit_error"] == "still queued"
+    assert shown["config_edit_note"] is None
     assert shown["size_unit"] == "BASE"
+    info.model_dump = lambda: {
+        "custom_info": {
+            "pending_config_edit": False,
+            "config_edit_note": "clamped to filled",
+            "size_unit": "BASE",
+        },
+    }
+    noted = service._format_executor_info("live-1", executor)
+    assert noted["pending_config_edit"] is False
+    assert noted["config_edit_error"] is None
+    assert noted["config_edit_note"] == "clamped to filled"
+
+
+@pytest.mark.asyncio
+async def test_an_applied_edit_with_a_note_is_stored(db):
+    """config_edit_note means the edit was applied. The note is not a drop."""
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.update_range_iceberg_config(executor_id, {"total_amount": "4"})
+    await service._write_final_state(executor_id, {
+        "side": "BUY",
+        "total_amount": "3",
+        "pending_config_edit": False,
+        "config_edit_note": "clamped to filled",
+        "config_edits": {"total_amount": "3", "size_unit": "BASE"},
+    })
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert saved["total_amount"] == "3"
+    assert saved["size_unit"] == "BASE"
+    assert state["pending_config_edit"] is False
+    assert state["config_edits"]["total_amount"] == "3"
+    assert state["config_edits"]["size_unit"] == "BASE"
+    assert state["config_edit_note"] == "clamped to filled"
+    assert "config_edit_error" not in state
+    service._active_executors.pop(executor_id, None)
+    shown = await service.get_executor(executor_id)
+    assert shown["pending_config_edit"] is False
+    assert shown["config_edit_error"] is None
+    assert shown["config_edit_note"] == "clamped to filled"
+
+
+@pytest.mark.asyncio
+async def test_a_note_does_not_drop_a_pending_edit(db):
+    """While pending_config_edit is true, a note leaves the queued edit in place."""
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.update_range_iceberg_config(
+        executor_id, {"total_amount": "4", "price_low": "90"},
+    )
+    executor = service._active_executors[executor_id]
+    executor.get_custom_info = lambda: {
+        "side": "BUY",
+        "total_amount": "1",
+        "pending_config_edit": True,
+        "config_edit_note": "cancels still pending",
+    }
+    await service._persist_running_child_orders(executor_id, executor)
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert saved["total_amount"] == "1"
+    assert "price_low" not in saved
+    assert state["pending_config_edit"] is True
+    assert state["config_edits"]["total_amount"] == "4"
+    assert state["config_edits"]["price_low"] == "90"
+    assert state["config_edit_note"] == "cancels still pending"
+    assert "config_edit_error" not in state
+    service._active_executors.pop(executor_id, None)
+    shown = await service.get_executor(executor_id)
+    assert shown["pending_config_edit"] is True
+    assert shown["config_edit_error"] is None
+    assert shown["config_edit_note"] == "cancels still pending"
 
 
 @pytest.mark.asyncio

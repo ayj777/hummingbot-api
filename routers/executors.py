@@ -143,8 +143,8 @@ async def update_range_iceberg(
     tick. Accepted edits return 200 ``{accepted, reason, executor_id}`` and
     are stored as pending ``config_edits``. The saved config changes when
     the executor reports the edit applied. A rejected edit returns 409 and
-    changes nothing. ``pending_config_edit`` and ``config_edit_error`` on
-    an executor response come from custom_info.
+    changes nothing. ``pending_config_edit``, ``config_edit_error``, and
+    ``config_edit_note`` on an executor response come from custom_info.
     """
     try:
         result = await executor_service.update_range_iceberg_config(

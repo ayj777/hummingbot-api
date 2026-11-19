@@ -504,6 +504,10 @@ class ExecutorResponse(BaseModel):
         default=None,
         description="Why a queued range iceberg edit was dropped, when the executor reported one",
     )
+    config_edit_note: Optional[str] = Field(
+        default=None,
+        description="Note on an applied range iceberg edit, such as a clamp or pending cancels",
+    )
     size_unit: Optional[str] = Field(
         default=None,
         description="Size unit the executor reports (BASE, QUOTE, or CONTRACTS)",

@@ -305,7 +305,8 @@ def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
     ``total_amount``, ``price_low``, ``price_high``, ``take_profit``, and
     ``stop_loss`` on custom_info itself are reporting fields. The executor
     always emits them, in its own size unit. They are not an edit. A dropped
-    edit sets ``config_edit_error`` and is not applied. ``size_unit`` on
+    edit sets ``config_edit_error`` and is not applied. ``config_edit_note``
+    is a note on an applied edit and does not drop it. ``size_unit`` on
     ``config_edits`` is the unit of that edit, not a reporting field.
     """
     source = _config_edits_source(custom)
@@ -393,8 +394,12 @@ def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
 
     Returns the custom_info to store and the edit to merge into the saved
     config. The saved config stays unchanged until ``pending_config_edit``
-    is false and ``config_edits`` is present. A ``config_edit_error`` drops
-    the pending edit. Reporting fields are left as the executor sent them.
+    is false and ``config_edits`` is present. A ``config_edit_error`` means
+    the edit was not applied and will not be, so the pending edit is
+    dropped. A ``config_edit_note`` means the edit was applied, with a note
+    such as a clamp or cancels still pending. The note does not drop the
+    edit. While ``pending_config_edit`` is true the pending edit is kept,
+    note or not. Reporting fields are left as the executor sent them.
     """
     payload = dict(reported) if isinstance(reported, dict) else {}
     stored_dict = stored if isinstance(stored, dict) else {}
@@ -404,6 +409,13 @@ def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
             return {}
         return {key: source[key] for key in _CONFIG_EDIT_CARRY_KEYS if key in source}
 
+    note = payload.get("config_edit_note")
+    if note in (None, ""):
+        payload.pop("config_edit_note", None)
+    else:
+        payload["config_edit_note"] = str(note)
+
+    # Only config_edit_error drops a pending edit. config_edit_note does not.
     error = payload.get("config_edit_error")
     if error not in (None, ""):
         payload["config_edit_error"] = str(error)
@@ -457,13 +469,15 @@ def _config_json_with_applied_edit(record: Any, applied: Optional[Dict[str, Any]
 
 
 def _config_edit_response_fields(custom_info: Any) -> Dict[str, Any]:
-    """pending_config_edit and config_edit_error for an executor response."""
+    """Edit status fields for an executor response."""
     info = custom_info if isinstance(custom_info, dict) else {}
     error = info.get("config_edit_error")
+    note = info.get("config_edit_note")
     size_unit = info.get("size_unit")
     return {
         "pending_config_edit": info.get("pending_config_edit") is True,
         "config_edit_error": None if error in (None, "") else str(error),
+        "config_edit_note": None if note in (None, "") else str(note),
         "size_unit": None if size_unit in (None, "") else str(size_unit),
     }
 
@@ -3600,6 +3614,7 @@ class ExecutorService:
                 final["config_edits"] = edits
                 final["pending_config_edit"] = True
                 final.pop("config_edit_error", None)
+                final.pop("config_edit_note", None)
                 await repo.update_executor(
                     executor_id,
                     final_state=json.dumps(final, default=_json_default),
