@@ -264,6 +264,9 @@ _RANGE_ICEBERG_EDIT_KEYS = (
     "take_profit",
     "stop_loss",
 )
+# size_unit travels with config_edits so a later restart knows the unit of
+# total_amount. It is not one of the PATCH fields.
+_CONFIG_EDIT_CARRY_KEYS = _RANGE_ICEBERG_EDIT_KEYS + ("size_unit",)
 
 
 def _json_edit_value(value: Any) -> Any:
@@ -284,14 +287,8 @@ def _json_edit_value(value: Any) -> Any:
     return value
 
 
-def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
-    """User edits stored on ``config_edits``.
-
-    ``total_amount``, ``price_low``, ``price_high``, ``take_profit``, and
-    ``stop_loss`` on custom_info itself are reporting fields. The executor
-    always emits them, in its own size unit. They are not an edit. A dropped
-    edit sets ``config_edit_error`` and is not applied.
-    """
+def _config_edits_source(custom: Any) -> Dict[str, Any]:
+    """The ``config_edits`` object, or empty when the edit was dropped."""
     if not isinstance(custom, dict):
         return {}
     if custom.get("config_edit_error") not in (None, ""):
@@ -299,6 +296,19 @@ def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
     source = custom.get("config_edits")
     if not isinstance(source, dict):
         return {}
+    return source
+
+
+def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
+    """User edits stored on ``config_edits``.
+
+    ``total_amount``, ``price_low``, ``price_high``, ``take_profit``, and
+    ``stop_loss`` on custom_info itself are reporting fields. The executor
+    always emits them, in its own size unit. They are not an edit. A dropped
+    edit sets ``config_edit_error`` and is not applied. ``size_unit`` on
+    ``config_edits`` is the unit of that edit, not a reporting field.
+    """
+    source = _config_edits_source(custom)
     return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
 
 
@@ -335,6 +345,20 @@ def _total_amount_in_base(
     return value
 
 
+def _edit_size_unit(custom: Any, size_unit: Any) -> Any:
+    """Unit of an edited total_amount.
+
+    ``config_edits.size_unit`` wins over the saved config. A resume rewrites
+    the running config to BASE, and the executor reports that unit on the
+    next edit. The config column can still say QUOTE until that write lands.
+    """
+    source = _config_edits_source(custom)
+    reported = source.get("size_unit")
+    if reported not in (None, ""):
+        return reported
+    return size_unit
+
+
 def _resume_edits_in_base(
     custom: Any,
     size_unit: Any,
@@ -345,15 +369,16 @@ def _resume_edits_in_base(
     edited = _range_iceberg_edit_overlay(custom)
     if "total_amount" not in edited:
         return edited
+    unit = _edit_size_unit(custom, size_unit)
     converted = _total_amount_in_base(
-        edited.get("total_amount"), size_unit, price, contract_size,
+        edited.get("total_amount"), unit, price, contract_size,
     )
     if converted is None:
         logger.error(
             "Could not convert edited total_amount %s from %s into base. "
             "Resuming on the open base.",
             edited.get("total_amount"),
-            size_unit or "BASE",
+            unit or "BASE",
         )
         edited = dict(edited)
         edited.pop("total_amount", None)
@@ -377,7 +402,7 @@ def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
     def _picked(source: Any) -> Dict[str, Any]:
         if not isinstance(source, dict):
             return {}
-        return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
+        return {key: source[key] for key in _CONFIG_EDIT_CARRY_KEYS if key in source}
 
     error = payload.get("config_edit_error")
     if error not in (None, ""):
@@ -411,7 +436,12 @@ def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
 
 
 def _config_json_with_applied_edit(record: Any, applied: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Merge an applied edit into the saved config, in the original size unit."""
+    """Merge an applied edit into the saved config.
+
+    ``size_unit`` is written with ``total_amount``. After a resume the
+    executor's amount is base, and the column has to say so. Leaving QUOTE
+    on the column makes the next restart divide that base amount again.
+    """
     if not applied or record is None:
         return None
     raw = getattr(record, "config", None)
@@ -430,9 +460,11 @@ def _config_edit_response_fields(custom_info: Any) -> Dict[str, Any]:
     """pending_config_edit and config_edit_error for an executor response."""
     info = custom_info if isinstance(custom_info, dict) else {}
     error = info.get("config_edit_error")
+    size_unit = info.get("size_unit")
     return {
         "pending_config_edit": info.get("pending_config_edit") is True,
         "config_edit_error": None if error in (None, "") else str(error),
+        "size_unit": None if size_unit in (None, "") else str(size_unit),
     }
 
 
@@ -1433,10 +1465,37 @@ class ExecutorService:
             self._drop_executor_memory(executor_id)
             raise
 
+        # The running config is BASE. The column has to say so before the
+        # next restart, or a later base edit is converted as if it were quote.
+        await self._persist_resumed_config(executor_id, config)
+
         # Every exchange stop is protected. Entry and exit client order ids
         # are leftover software orders and startup cancels them, including for
         # this resumed executor.
         return _exchange_stop_ids(custom)
+
+    async def _persist_resumed_config(self, executor_id: str, config: Dict[str, Any]) -> None:
+        """Store the config the resumed executor is running."""
+        if not getattr(self, "db_manager", None):
+            return
+        try:
+            encoded = json.dumps(config, default=_json_default)
+        except Exception:
+            logger.error(
+                "Could not serialize the resumed config for %s", executor_id, exc_info=True,
+            )
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                updated = await ExecutorRepository(session).update_executor(
+                    executor_id, config=encoded,
+                )
+            if updated is None:
+                logger.error("No executor row to store the resumed config for %s", executor_id)
+        except Exception:
+            logger.error(
+                "Could not store the resumed config for %s", executor_id, exc_info=True,
+            )
 
     def _saved_side_name(self, item: Dict[str, Any]) -> str:
         custom = item.get("custom") or {}

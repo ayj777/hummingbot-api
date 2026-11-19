@@ -1485,6 +1485,11 @@ async def test_quote_sized_executor_resumes_in_base(db, caplog):
     assert resumed.restored["resume_entries"] is False
     assert Decimal(resumed.restored["open_base"]) == Decimal("50")
     assert Decimal(resumed.restored["filled_quote"]) == Decimal("8.5")
+    stored_config = json.loads(
+        next(row for row in db.query(ExecutorRecord) if row.executor_id == "quote-1").config
+    )
+    assert stored_config["size_unit"] == "BASE"
+    assert stored_config["total_amount"] == "50"
 
 
 @pytest.mark.asyncio
@@ -2683,13 +2688,14 @@ async def _resume_sized_executor(
     position="50",
     filled_quote="8.5",
     entry_price="0.17",
+    open_base="50",
 ):
     custom = {
         "resume_on_startup": True,
         "exit_state": "RESTING",
         "side": "BUY",
-        "open_base": "50",
-        "filled_base": "50",
+        "open_base": open_base,
+        "filled_base": open_base,
         "exchange_stop_order_id": "stop-x",
         "total_amount": config_total,
         "target_amount": config_total,
@@ -2903,6 +2909,7 @@ def test_live_executor_response_surfaces_the_config_edit():
                 "pending_config_edit": True,
                 "config_edit_error": "still queued",
                 "total_amount": "8.5",
+                "size_unit": "BASE",
             },
         },
     )
@@ -2919,3 +2926,104 @@ def test_live_executor_response_surfaces_the_config_edit():
     shown = service._format_executor_info("live-1", executor)
     assert shown["pending_config_edit"] is True
     assert shown["config_edit_error"] == "still queued"
+    assert shown["size_unit"] == "BASE"
+
+
+@pytest.mark.asyncio
+async def test_u1b_quote_edit_resumes_as_200_base(db):
+    """20 USDT at 0.1 is 200 base. The config column is still QUOTE."""
+    service, connector = await _resume_sized_executor(
+        db,
+        "u1b",
+        "QUOTE",
+        "10",
+        extra_custom={"config_edits": {"total_amount": "20", "size_unit": "QUOTE"}},
+        position="100",
+        filled_quote="10",
+        entry_price="0.1",
+        open_base="100",
+    )
+    resumed = service._active_executors["u1b"]
+    assert resumed.config.size_unit == "BASE"
+    assert Decimal(resumed.config.total_amount) == Decimal("200")
+    assert connector.stop_cancels == []
+
+
+@pytest.mark.asyncio
+async def test_u2_base_edit_on_a_quote_column_stays_200(db):
+    """config_edits.size_unit BASE wins over a config column that still says QUOTE."""
+    service, connector = await _resume_sized_executor(
+        db,
+        "u2",
+        "QUOTE",
+        "10",
+        extra_custom={"config_edits": {"total_amount": "200", "size_unit": "BASE"}},
+        position="100",
+        filled_quote="10",
+        entry_price="0.1",
+        open_base="100",
+    )
+    resumed = service._active_executors["u2"]
+    assert resumed.config.size_unit == "BASE"
+    assert Decimal(resumed.config.total_amount) == Decimal("200")
+    assert connector.stop_cancels == []
+    stored = json.loads(
+        next(row for row in db.query(ExecutorRecord) if row.executor_id == "u2").config
+    )
+    assert stored["size_unit"] == "BASE"
+    assert stored["total_amount"] == "200"
+
+
+@pytest.mark.asyncio
+async def test_u4_edit_after_resume_is_not_converted_again(db):
+    """QUOTE 10 USDT, 100 base at 0.1, then a base edit of 300, stays 300."""
+    service, connector = await _resume_sized_executor(
+        db,
+        "u4",
+        "QUOTE",
+        "10",
+        position="100",
+        filled_quote="10",
+        entry_price="0.1",
+        open_base="100",
+    )
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "u4")
+    stored = json.loads(row.config)
+    assert stored["size_unit"] == "BASE"
+    assert stored["total_amount"] == "100"
+
+    resumed = service._active_executors["u4"]
+    resumed.update_config = lambda changes: {"accepted": True, "reason": ""}
+    accepted = await service.update_range_iceberg_config("u4", {"total_amount": "300"})
+    assert accepted["accepted"] is True
+    await service._write_final_state("u4", {
+        "side": "BUY",
+        "size_unit": "BASE",
+        "total_amount": "300",
+        "open_base": "100",
+        "filled_base": "100",
+        "filled_quote": "10",
+        "exit_state": "RESTING",
+        "resume_on_startup": True,
+        "exchange_stop_order_id": "stop-x",
+        "pending_config_edit": False,
+        "config_edits": {"total_amount": "300", "size_unit": "BASE"},
+    })
+    row = next(row for row in db.query(ExecutorRecord) if row.executor_id == "u4")
+    stored = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert stored["size_unit"] == "BASE"
+    assert stored["total_amount"] == "300"
+    assert state["config_edits"]["size_unit"] == "BASE"
+    assert state["config_edits"]["total_amount"] == "300"
+    assert state["size_unit"] == "BASE"
+
+    service._active_executors.pop("u4", None)
+    service._executor_metadata.pop("u4", None)
+    await service.cleanup_orphaned_executors()
+    again = service._active_executors["u4"]
+    assert again.config.size_unit == "BASE"
+    assert Decimal(again.config.total_amount) == Decimal("300")
+    assert connector.stop_cancels == []
+    shown = service._format_db_record(row)
+    assert shown["size_unit"] == "BASE"
