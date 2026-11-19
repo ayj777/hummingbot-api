@@ -1,7 +1,7 @@
 """Refuse to start against a hummingbot core that predates what this API reads.
 
 ``environment.yml`` pins ``hummingbot`` to ayj777/hummingbot commit
-``7bcfbca70191dbf1ebc1ed8725e85fedeb718505`` (PR #8 on master). Those changes
+``c050b13336928d21da9a5b3e6daaa72c3ff4e8c6`` (PR #9 on master). Those changes
 are not in a PyPI release yet. An image built from an older core comes up
 without the fields this API reads.
 
@@ -18,10 +18,11 @@ from typing import List, Tuple
 # (import path, attribute, what it is for) — each one a field this API reads off the
 # core and cannot substitute.
 REQUIRED_CORE_SURFACE: List[Tuple[str, str, str]] = [
-    # Empty on purpose. This guard exists for a core field this API reads that a released
-    # hummingbot may not carry yet; there is no such field right now. volume_traded_quote
-    # was the last one, and it is gone: filled_amount_quote means the volume traded on
-    # every executor, including LP, so there is nothing extra to require.
+    (
+        "hummingbot.strategy_v2.models.executors:CloseType",
+        "POSITION_CLOSED_EXTERNALLY",
+        "an external full close, stored as close type 11",
+    ),
 ]
 
 
