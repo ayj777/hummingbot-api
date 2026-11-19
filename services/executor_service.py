@@ -285,18 +285,155 @@ def _json_edit_value(value: Any) -> Any:
 
 
 def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
-    """Edited range iceberg fields carried in custom_info.
+    """User edits stored on ``config_edits``.
 
-    ``config_edits`` is the accepted edit. When that object is absent, the
-    same keys on custom_info itself are used. Either one wins over the
-    original saved config.
+    ``total_amount``, ``price_low``, ``price_high``, ``take_profit``, and
+    ``stop_loss`` on custom_info itself are reporting fields. The executor
+    always emits them, in its own size unit. They are not an edit. A dropped
+    edit sets ``config_edit_error`` and is not applied.
     """
     if not isinstance(custom, dict):
         return {}
+    if custom.get("config_edit_error") not in (None, ""):
+        return {}
     source = custom.get("config_edits")
     if not isinstance(source, dict):
-        source = custom
+        return {}
     return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
+
+
+def _total_amount_in_base(
+    amount: Any,
+    size_unit: Any,
+    price: Optional[Decimal],
+    contract_size: Optional[Decimal],
+) -> Optional[Decimal]:
+    """Edited ``total_amount`` converted into base.
+
+    ``config_edits`` stores the amount in the executor's own size unit.
+    Resume forces ``size_unit`` BASE, so a quote or contract amount has to
+    be converted before it replaces the open base. None means the amount
+    cannot be converted and the caller keeps the open base.
+    """
+    if amount is None or amount == "":
+        return None
+    try:
+        value = Decimal(str(amount))
+    except Exception:
+        return None
+    unit = str(size_unit or "BASE").strip().upper()
+    if unit in ("", "BASE"):
+        return value
+    if unit == "QUOTE":
+        if price is None or price <= 0:
+            return None
+        return value / price
+    if unit == "CONTRACTS":
+        if contract_size is None or contract_size <= 0:
+            return None
+        return value * contract_size
+    return value
+
+
+def _resume_edits_in_base(
+    custom: Any,
+    size_unit: Any,
+    price: Optional[Decimal],
+    contract_size: Optional[Decimal],
+) -> Dict[str, Any]:
+    """config_edits for a BASE resume. ``total_amount`` is converted."""
+    edited = _range_iceberg_edit_overlay(custom)
+    if "total_amount" not in edited:
+        return edited
+    converted = _total_amount_in_base(
+        edited.get("total_amount"), size_unit, price, contract_size,
+    )
+    if converted is None:
+        logger.error(
+            "Could not convert edited total_amount %s from %s into base. "
+            "Resuming on the open base.",
+            edited.get("total_amount"),
+            size_unit or "BASE",
+        )
+        edited = dict(edited)
+        edited.pop("total_amount", None)
+        return edited
+    edited = dict(edited)
+    edited["total_amount"] = format(converted, "f")
+    return edited
+
+
+def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
+    """Carry a pending edit, or accept the one the executor says it applied.
+
+    Returns the custom_info to store and the edit to merge into the saved
+    config. The saved config stays unchanged until ``pending_config_edit``
+    is false and ``config_edits`` is present. A ``config_edit_error`` drops
+    the pending edit. Reporting fields are left as the executor sent them.
+    """
+    payload = dict(reported) if isinstance(reported, dict) else {}
+    stored_dict = stored if isinstance(stored, dict) else {}
+
+    def _picked(source: Any) -> Dict[str, Any]:
+        if not isinstance(source, dict):
+            return {}
+        return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
+
+    error = payload.get("config_edit_error")
+    if error not in (None, ""):
+        payload["config_edit_error"] = str(error)
+        payload["pending_config_edit"] = False
+        payload.pop("config_edits", None)
+        return payload, None
+
+    reported_edits = _picked(payload.get("config_edits")) if "config_edits" in payload else None
+    if "pending_config_edit" in payload and payload.get("pending_config_edit") is False:
+        if reported_edits:
+            payload["config_edits"] = reported_edits
+            payload["pending_config_edit"] = False
+            return payload, reported_edits
+        payload.pop("config_edits", None)
+        payload["pending_config_edit"] = False
+        return payload, None
+
+    if reported_edits is not None:
+        payload["config_edits"] = reported_edits
+        if "pending_config_edit" not in payload and "pending_config_edit" in stored_dict:
+            payload["pending_config_edit"] = stored_dict.get("pending_config_edit") is True
+        return payload, None
+
+    stored_edits = _picked(stored_dict.get("config_edits"))
+    if stored_edits:
+        payload["config_edits"] = stored_edits
+        if "pending_config_edit" in stored_dict:
+            payload["pending_config_edit"] = stored_dict.get("pending_config_edit") is True
+    return payload, None
+
+
+def _config_json_with_applied_edit(record: Any, applied: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Merge an applied edit into the saved config, in the original size unit."""
+    if not applied or record is None:
+        return None
+    raw = getattr(record, "config", None)
+    try:
+        config = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Saved config is not JSON, so the applied edit was not stored on it")
+        return None
+    if not isinstance(config, dict):
+        return None
+    config.update({key: _json_edit_value(value) for key, value in applied.items()})
+    return json.dumps(config, default=_json_default)
+
+
+def _config_edit_response_fields(custom_info: Any) -> Dict[str, Any]:
+    """pending_config_edit and config_edit_error for an executor response."""
+    info = custom_info if isinstance(custom_info, dict) else {}
+    error = info.get("config_edit_error")
+    return {
+        "pending_config_edit": info.get("pending_config_edit") is True,
+        "config_edit_error": None if error in (None, "") else str(error),
+    }
 
 
 _RELEASE_LEAVES_THE_POSITION = (
@@ -478,6 +615,7 @@ def _exit_only_custom_info(
     custom: Dict[str, Any],
     open_base: Decimal,
     average: Optional[Decimal],
+    edits: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Clean restore payload that continues exits only.
 
@@ -546,7 +684,11 @@ def _exit_only_custom_info(
     if "exchange_stop_released" in custom or "exchange_stop_released" in exit_blob:
         payload["exchange_stop_released"] = released
         payload["exit"]["exchange_stop_released"] = released
-    edited = _range_iceberg_edit_overlay(custom)
+    # edits is already in base. Only config_edits is an edit. The reporting
+    # total_amount on custom_info is the original size unit and is not copied.
+    edited = edits if isinstance(edits, dict) else _resume_edits_in_base(
+        custom, "BASE", average, None,
+    )
     payload.update(edited)
     if "total_amount" in edited:
         payload["target_amount"] = edited["total_amount"]
@@ -1067,14 +1209,17 @@ class ExecutorService:
         if not self.db_manager:
             return
         try:
-            encoded = json.dumps(payload, default=_json_default)
-        except Exception as exc:
-            logger.error("Could not serialize resume state for executor %s: %s", executor_id, exc)
-            return
-        try:
             async with self.db_manager.get_session_context() as session:
-                updated = await ExecutorRepository(session).update_executor(
-                    executor_id, final_state=encoded
+                repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                stored = _parse_stored_custom_info(record.final_state) if record is not None else {}
+                folded, applied = _fold_reported_config_edit(stored, payload)
+                encoded = json.dumps(folded, default=_json_default)
+                config_json = _config_json_with_applied_edit(record, applied)
+                updated = await repo.update_executor(
+                    executor_id,
+                    final_state=encoded,
+                    config=config_json,
                 )
             if updated is None:
                 logger.error(
@@ -1218,11 +1363,18 @@ class ExecutorService:
         # be read as quote and place a much larger new entry. resume_entries
         # false is the same instruction on the config the executor reads.
         open_base = _reported_decimal(None, custom, "open_base")
-        edited = _range_iceberg_edit_overlay(custom)
+        edited = item.get("_resume_edits")
+        if not isinstance(edited, dict):
+            edited = _resume_edits_in_base(
+                custom,
+                config.get("size_unit"),
+                _resume_entry_average(custom, None),
+                self._contract_size_for_resume(item),
+            )
         if open_base is not None:
-            # An accepted edit's total_amount wins over the open base. Without
-            # an edit, the open base is the size so a QUOTE config is not
-            # resumed as a new quote order.
+            # An edit's total_amount, converted into base, wins over the open
+            # base. Without that key, the open base is the size. A reported
+            # quote total is not an edit and must not become the base size.
             if "total_amount" not in edited:
                 config["total_amount"] = format(open_base, "f")
             config["size_unit"] = "BASE"
@@ -1612,8 +1764,29 @@ class ExecutorService:
                 shares.append(f"{item['executor_id']}={format(share, 'f')}")
                 custom = item["custom"]
                 average = _resume_entry_average(custom, item.get("_entry_price"))
+                size_unit = None
+                try:
+                    saved_config = json.loads(item.get("config_json") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    saved_config = None
+                if isinstance(saved_config, dict):
+                    size_unit = saved_config.get("size_unit")
+                price = average
+                if (price is None or price <= 0) and isinstance(saved_config, dict):
+                    for key in ("limit_price", "price_low"):
+                        candidate = _reported_decimal(None, saved_config, key)
+                        if candidate is not None and candidate > 0:
+                            price = candidate
+                            break
+                edits = _resume_edits_in_base(
+                    custom,
+                    size_unit,
+                    price,
+                    self._contract_size_for_resume(item),
+                )
                 attempt = dict(item)
-                attempt["custom"] = _exit_only_custom_info(custom, share, average)
+                attempt["_resume_edits"] = edits
+                attempt["custom"] = _exit_only_custom_info(custom, share, average, edits)
                 state = item.get("_state")
                 stop_ids = _exchange_stop_ids(custom)
                 try:
@@ -1863,6 +2036,33 @@ class ExecutorService:
             return None
         return connectors.get(connector_name)
 
+    def _contract_size_for_resume(self, item: Dict[str, Any]) -> Optional[Decimal]:
+        """Contract size for a CONTRACTS total_amount, in base per contract.
+
+        A connector without ``get_contract_size`` counts one base per contract,
+        matching the executor. A getter that fails leaves the size unknown so
+        the open base is kept instead of the raw contract count.
+        """
+        connector = self._account_connector(
+            item.get("account_name") or getattr(self, "default_account", ""),
+            item.get("connector_name") or "",
+        )
+        if connector is None:
+            return Decimal("1")
+        getter = getattr(connector, "get_contract_size", None)
+        if not callable(getter):
+            return Decimal("1")
+        try:
+            size = Decimal(str(getter(item.get("trading_pair"))))
+        except Exception:
+            logger.error(
+                "Could not read contract size for range iceberg %s",
+                item.get("executor_id"),
+                exc_info=True,
+            )
+            return None
+        return size if size > 0 else None
+
     @staticmethod
     def _safe_custom_info(executor: Any) -> Dict[str, Any]:
         getter = getattr(executor, "get_custom_info", None)
@@ -1911,14 +2111,17 @@ class ExecutorService:
         side = info.get("side") or "BUY"
         trade_type = side.name if hasattr(side, "name") else str(side)
         try:
-            final_state_json = json.dumps(info, default=_json_default)
-        except Exception as e:
-            logger.warning(f"Could not serialize custom_info for {executor_id}: {e}")
-            final_state_json = None
-
-        try:
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                stored = _parse_stored_custom_info(record.final_state) if record is not None else {}
+                folded, applied_edit = _fold_reported_config_edit(stored, info)
+                try:
+                    final_state_json = json.dumps(folded, default=_json_default)
+                except Exception as e:
+                    logger.warning(f"Could not serialize custom_info for {executor_id}: {e}")
+                    final_state_json = None
+                applied_config = _config_json_with_applied_edit(record, applied_edit)
                 existing = {
                     row.client_order_id: row
                     for row in await repo.get_executor_orders(executor_id)
@@ -1939,8 +2142,12 @@ class ExecutorService:
                 for oid, row in existing.items():
                     if oid not in signature and (row.status or "").upper() not in _TERMINAL_ORDER_STATUSES:
                         await repo.update_executor_order(oid, status="DONE")
-                if final_state_json is not None:
-                    await repo.update_executor(executor_id, final_state=final_state_json)
+                if final_state_json is not None or applied_config is not None:
+                    await repo.update_executor(
+                        executor_id,
+                        final_state=final_state_json,
+                        config=applied_config,
+                    )
             cache[executor_id] = signature
         except Exception as e:
             logger.error(f"Error persisting child orders for executor {executor_id}: {e}")
@@ -3310,15 +3517,13 @@ class ExecutorService:
         executor_id: str,
         changes: Dict[str, Any],
     ) -> None:
-        """Write an accepted edit onto the saved config and custom_info."""
-        metadata = self._executor_metadata.setdefault(executor_id, {})
-        config = metadata.get("config")
-        if not isinstance(config, dict):
-            config = {}
-        config = dict(config)
+        """Store an accepted edit as pending config_edits.
+
+        The saved config is the config the executor is still running. It is
+        updated only after the executor reports the edit applied. The pending
+        object is what a restart reads, in the executor's own size unit.
+        """
         stored = {key: _json_edit_value(value) for key, value in changes.items()}
-        config.update(stored)
-        metadata["config"] = config
         if not getattr(self, "db_manager", None):
             return
         try:
@@ -3329,29 +3534,17 @@ class ExecutorService:
                     logger.error("No executor row to store the edit for %s", executor_id)
                     return
                 final = _parse_stored_custom_info(record.final_state)
-                final.update(stored)
-                if "total_amount" in stored:
-                    final["target_amount"] = stored["total_amount"]
                 edits = final.get("config_edits")
                 if not isinstance(edits, dict):
                     edits = {}
                 edits.update(stored)
                 final["config_edits"] = edits
-                saved_config = dict(config)
-                if record.config:
-                    try:
-                        parsed = json.loads(record.config)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        saved_config = parsed
-                        saved_config.update(stored)
+                final["pending_config_edit"] = True
+                final.pop("config_edit_error", None)
                 await repo.update_executor(
                     executor_id,
-                    config=json.dumps(saved_config, default=_json_default),
                     final_state=json.dumps(final, default=_json_default),
                 )
-            metadata["config"] = saved_config
         except Exception as exc:
             logger.error(
                 "Could not persist range iceberg edit for %s: %s",
@@ -3918,6 +4111,7 @@ class ExecutorService:
         result["error_count"] = self._log_capture.get_error_count(executor_id)
         result["last_error"] = self._log_capture.get_last_error(executor_id)
         result.update(_resume_search_fields(result.get("custom_info")))
+        result.update(_config_edit_response_fields(result.get("custom_info")))
 
         return result
 
@@ -3972,6 +4166,9 @@ class ExecutorService:
             "error_count": error_count,
             "last_error": last_error,
             **_resume_search_fields(
+                json.loads(record.final_state) if record.final_state else None
+            ),
+            **_config_edit_response_fields(
                 json.loads(record.final_state) if record.final_state else None
             ),
         }

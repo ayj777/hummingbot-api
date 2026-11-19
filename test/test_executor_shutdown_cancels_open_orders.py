@@ -1446,6 +1446,12 @@ async def test_quote_sized_executor_resumes_in_base(db, caplog):
             "filled_base": "50",
             "filled_quote": "8.5",
             "exchange_stop_order_id": "stop-x",
+            "total_amount": "8.5",
+            "target_amount": "8.5",
+            "price_low": "0.1",
+            "price_high": "0.2",
+            "take_profit": {"percent": "0.01"},
+            "stop_loss": {"percent": "0.02"},
         },
         config={
             "type": "range_iceberg_executor",
@@ -1472,7 +1478,9 @@ async def test_quote_sized_executor_resumes_in_base(db, caplog):
     resumed = service._active_executors["quote-1"]
     assert resumed.config.size_unit == "BASE"
     assert resumed.config.total_amount == "50"
+    assert getattr(resumed.config, "price_low", None) is None
     assert resumed.config.resume_entries is False
+    assert resumed.restored.get("total_amount") is None
     assert resumed.restored["size_unit"] == "BASE"
     assert resumed.restored["resume_entries"] is False
     assert Decimal(resumed.restored["open_base"]) == Decimal("50")
@@ -2515,15 +2523,16 @@ async def test_accepted_range_iceberg_edit_survives_resume(db):
 
     rows = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id]
     saved = json.loads(rows[0].config)
-    assert saved["total_amount"] == "3"
-    assert saved["price_low"] == "90"
-    assert saved["price_high"] == "110"
-    assert saved["take_profit"] == {"percent": "0.02", "execution": "MARKET"}
-    assert saved["stop_loss"] is None
+    assert saved["total_amount"] == "1"
+    assert "price_low" not in saved
     assert saved["side"] == "BUY"
     state = json.loads(rows[0].final_state)
-    assert state["target_amount"] == "3"
+    assert state["pending_config_edit"] is True
+    assert "target_amount" not in state
     assert state["config_edits"]["total_amount"] == "3"
+    assert state["config_edits"]["price_low"] == "90"
+    assert state["config_edits"]["price_high"] == "110"
+    assert state["config_edits"]["take_profit"] == {"percent": "0.02", "execution": "MARKET"}
     assert state["config_edits"]["stop_loss"] is None
 
     state["resume_on_startup"] = True
@@ -2531,6 +2540,8 @@ async def test_accepted_range_iceberg_edit_survives_resume(db):
     state["open_base"] = "1"
     state["side"] = "BUY"
     state["exchange_stop_order_id"] = "stop-kept"
+    state["total_amount"] = "8.5"
+    state["price_low"] = "1"
     async with db.session_context() as session:
         await ExecutorRepository(session).update_executor(
             executor_id, final_state=json.dumps(state)
@@ -2634,12 +2645,14 @@ async def test_concurrent_range_iceberg_edits_do_not_interleave(db):
     assert first["accepted"] is True
     assert second["accepted"] is True
     assert executor.overlapped is False
-    saved = json.loads(
-        [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0].config
-    )
-    assert saved["total_amount"] == "4"
-    assert saved["price_low"] == "80"
-    assert saved["price_high"] == "120"
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    assert saved["total_amount"] == "1"
+    state = json.loads(row.final_state)
+    assert state["pending_config_edit"] is True
+    assert state["config_edits"]["total_amount"] == "4"
+    assert state["config_edits"]["price_low"] == "80"
+    assert state["config_edits"]["price_high"] == "120"
 
 
 @pytest.mark.asyncio
@@ -2658,3 +2671,251 @@ async def test_editing_a_range_iceberg_does_not_free_its_slot(db):
     other = await service.create_executor(_open_config("SELL"), account_name="master")
     assert other["executor_id"] != executor_id
     assert executor_id in service._active_executors
+
+
+async def _resume_sized_executor(
+    db,
+    executor_id,
+    size_unit,
+    config_total,
+    extra_custom=None,
+    contract_size=None,
+    position="50",
+    filled_quote="8.5",
+    entry_price="0.17",
+):
+    custom = {
+        "resume_on_startup": True,
+        "exit_state": "RESTING",
+        "side": "BUY",
+        "open_base": "50",
+        "filled_base": "50",
+        "exchange_stop_order_id": "stop-x",
+        "total_amount": config_total,
+        "target_amount": config_total,
+        "price_low": "9",
+        "price_high": "11",
+        "take_profit": {"percent": "0.01"},
+        "stop_loss": {"percent": "0.02"},
+    }
+    if filled_quote is not None:
+        custom["filled_quote"] = filled_quote
+    if extra_custom:
+        custom.update(extra_custom)
+    await _seed_iceberg_row(
+        db,
+        executor_id,
+        custom,
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "BUY",
+            "size_unit": size_unit,
+            "total_amount": config_total,
+        },
+    )
+    connector = _Connector()
+    connector.account_positions = {
+        "BTC-USDT:LONG": SimpleNamespace(
+            trading_pair="BTC-USDT",
+            position_side=SimpleNamespace(name="LONG"),
+            amount=Decimal(position),
+            entry_price=Decimal(entry_price),
+        )
+    }
+    if contract_size is not None:
+        connector.get_contract_size = lambda _pair: contract_size
+    service = _service(db, {"master": {"mexc_perpetual": connector}})
+    _install_resume_factory(service)
+    await service.cleanup_orphaned_executors()
+    return service, connector
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "size_unit", "config_total", "edits", "contract_size", "expected"),
+    [
+        ("quote", "QUOTE", "8.5", None, None, "50"),
+        ("base", "BASE", "80", None, None, "50"),
+        ("contracts", "CONTRACTS", "10", None, "2", "50"),
+        ("quote-edit", "QUOTE", "8.5", {"total_amount": "17", "price_low": "0.15"}, None, "100"),
+        ("base-edit", "BASE", "80", {"total_amount": "60"}, None, "60"),
+        ("contracts-edit", "CONTRACTS", "10", {"total_amount": "20", "price_high": "3"}, "2", "40"),
+    ],
+)
+async def test_resume_size_uses_open_base_unless_config_edits_sets_total(
+    db, name, size_unit, config_total, edits, contract_size, expected,
+):
+    """8.5 USDT with 50 base filled resumes as base 50 unless config_edits says otherwise."""
+    extra = {"config_edits": edits} if edits else None
+    service, connector = await _resume_sized_executor(
+        db,
+        f"sized-{name}",
+        size_unit,
+        config_total,
+        extra_custom=extra,
+        contract_size=contract_size,
+    )
+    resumed = service._active_executors[f"sized-{name}"]
+    assert resumed.config.size_unit == "BASE"
+    assert Decimal(resumed.config.total_amount) == Decimal(expected)
+    assert resumed.config.resume_entries is False
+    assert connector.stop_cancels == []
+    if edits and "total_amount" in edits:
+        assert Decimal(resumed.restored["total_amount"]) == Decimal(expected)
+        assert Decimal(resumed.restored["target_amount"]) == Decimal(expected)
+    else:
+        assert resumed.restored.get("total_amount") is None
+    if edits and "price_low" in edits:
+        assert resumed.config.price_low == edits["price_low"]
+        assert resumed.restored["price_low"] == edits["price_low"]
+    else:
+        assert getattr(resumed.config, "price_low", None) is None
+    if edits and "price_high" in edits:
+        assert resumed.config.price_high == edits["price_high"]
+    else:
+        assert getattr(resumed.config, "price_high", None) is None
+
+
+@pytest.mark.asyncio
+async def test_unconvertible_quote_edit_keeps_the_open_base(db, caplog):
+    with caplog.at_level(logging.ERROR):
+        service, connector = await _resume_sized_executor(
+            db,
+            "quote-blind",
+            "QUOTE",
+            "8.5",
+            extra_custom={"config_edits": {"total_amount": "17"}},
+            filled_quote=None,
+            entry_price="0",
+        )
+    resumed = service._active_executors["quote-blind"]
+    assert Decimal(resumed.config.total_amount) == Decimal("50")
+    assert connector.stop_cancels == []
+    assert "Could not convert edited total_amount" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dropped_config_edit_is_not_resumed_and_is_visible(db):
+    service, _connector = await _resume_sized_executor(
+        db,
+        "dropped-1",
+        "QUOTE",
+        "8.5",
+        extra_custom={
+            "config_edits": {"total_amount": "17"},
+            "config_edit_error": "the edit was dropped",
+            "pending_config_edit": False,
+        },
+    )
+    resumed = service._active_executors["dropped-1"]
+    assert Decimal(resumed.config.total_amount) == Decimal("50")
+    service._active_executors.pop("dropped-1", None)
+    rows = await service.get_executors()
+    shown = next(row for row in rows if row["executor_id"] == "dropped-1")
+    assert shown["pending_config_edit"] is False
+    assert shown["config_edit_error"] == "the edit was dropped"
+
+
+@pytest.mark.asyncio
+async def test_pending_edit_stays_pending_until_the_executor_applies_it(db):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.update_range_iceberg_config(
+        executor_id, {"total_amount": "4", "price_low": "90"},
+    )
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    assert json.loads(row.config)["total_amount"] == "1"
+
+    executor = service._active_executors[executor_id]
+    executor.get_custom_info = lambda: {
+        "side": "BUY",
+        "total_amount": "8.5",
+        "price_low": "1",
+        "child_order_ids": ["c1"],
+    }
+    await service._persist_running_child_orders(executor_id, executor)
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert saved["total_amount"] == "1"
+    assert "price_low" not in saved
+    assert state["pending_config_edit"] is True
+    assert state["config_edits"]["total_amount"] == "4"
+    assert state["total_amount"] == "8.5"
+
+    executor.get_custom_info = lambda: {
+        "side": "BUY",
+        "total_amount": "8.5",
+        "child_order_ids": ["c1", "c2"],
+        "pending_config_edit": False,
+        "config_edits": {"total_amount": "4", "price_low": "90"},
+    }
+    await service._persist_running_child_orders(executor_id, executor)
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert saved["total_amount"] == "4"
+    assert saved["price_low"] == "90"
+    assert state["pending_config_edit"] is False
+    assert state["config_edits"]["total_amount"] == "4"
+    assert state["total_amount"] == "8.5"
+
+    service._active_executors.pop(executor_id, None)
+    shown = await service.get_executor(executor_id)
+    assert shown["pending_config_edit"] is False
+    assert shown["config_edit_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_reported_drop_clears_the_pending_edit(db):
+    service = _open_service(db)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    executor_id = created["executor_id"]
+    await service.update_range_iceberg_config(executor_id, {"total_amount": "4"})
+    await service._write_final_state(executor_id, {
+        "side": "BUY",
+        "total_amount": "1",
+        "pending_config_edit": False,
+        "config_edit_error": "the edit was dropped",
+    })
+    row = [row for row in db.query(ExecutorRecord) if row.executor_id == executor_id][0]
+    saved = json.loads(row.config)
+    state = json.loads(row.final_state)
+    assert saved["total_amount"] == "1"
+    assert "config_edits" not in state
+    assert state["pending_config_edit"] is False
+    assert state["config_edit_error"] == "the edit was dropped"
+    service._active_executors.pop(executor_id, None)
+    shown = await service.get_executor(executor_id)
+    assert shown["pending_config_edit"] is False
+    assert shown["config_edit_error"] == "the edit was dropped"
+
+
+def test_live_executor_response_surfaces_the_config_edit():
+    service = _service()
+    info = SimpleNamespace(
+        side=SimpleNamespace(name="BUY"),
+        model_dump=lambda: {
+            "custom_info": {
+                "pending_config_edit": True,
+                "config_edit_error": "still queued",
+                "total_amount": "8.5",
+            },
+        },
+    )
+    executor = SimpleNamespace(
+        executor_info=info,
+        status=SimpleNamespace(name="RUNNING"),
+        close_type=None,
+        is_closed=False,
+    )
+    service._executor_metadata["live-1"] = {
+        "executor_type": "range_iceberg_executor",
+        "account_name": "master",
+    }
+    shown = service._format_executor_info("live-1", executor)
+    assert shown["pending_config_edit"] is True
+    assert shown["config_edit_error"] == "still queued"

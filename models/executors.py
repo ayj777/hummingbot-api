@@ -496,6 +496,14 @@ class ExecutorResponse(BaseModel):
                     "it has earned none.")
     error_count: int = Field(default=0, description="Number of ERROR-level log entries captured")
     last_error: Optional[str] = Field(default=None, description="Most recent error message, if any")
+    pending_config_edit: bool = Field(
+        default=False,
+        description="True while an accepted range iceberg edit is queued and not yet applied",
+    )
+    config_edit_error: Optional[str] = Field(
+        default=None,
+        description="Why a queued range iceberg edit was dropped, when the executor reported one",
+    )
 
 
 class ExecutorDetailResponse(ExecutorResponse):
