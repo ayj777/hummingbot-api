@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type
 
 from fastapi import HTTPException
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
@@ -77,6 +78,9 @@ _LEVEL_KEYS = ("levels", "orders")
 # exchange-side stop. TRIGGERED, DONE, and NONE stay on the ordinary cancel path.
 _RESUMABLE_EXIT_STATES = frozenset({"ARMED", "RESTING", "CLOSING"})
 _RESUME_ON_STARTUP = "resume_on_startup"
+_RANGE_ICEBERG_OPEN_CAP = 10
+_ENTRY_PAUSE_DWELL = 2
+_PRICE_DISAGREE = Decimal("0.01")
 _RESUME_FAILED = "resume_failed"
 _RESUME_ERROR = "resume_error"
 _RESUME_ENTRIES = "resume_entries"
@@ -548,24 +552,47 @@ def _range_iceberg_externally_closed(close_type: Any, custom_info: Any) -> bool:
     return isinstance(custom_info, dict) and custom_info.get("external_close") is True
 
 
+def _sibling_hint_reported(custom_info: Any) -> bool:
+    """True when this tier was given a sibling hint, including zero."""
+    return (
+        isinstance(custom_info, dict)
+        and "sibling_base" in custom_info
+        and custom_info.get("sibling_base") not in (None, "")
+    )
+
+
 def range_iceberg_held_base(executor: Any, custom_info: Any) -> Optional[Decimal]:
-    """Base still held by a range iceberg.
+    """Base still held by one range iceberg tier.
 
     An external close holds nothing, even when ``open_base`` is still the old
     size. The executor's close type counts even when ``external_close`` is
-    still false. Otherwise ``exchange_position_base`` is the live book and
-    wins over ``open_base``. With neither, ``open_base`` when that field is present.
-    Otherwise ``filled_base`` minus ``closed_base`` when both are present.
-    Otherwise ``filled_base``. None when none of those fields were reported,
-    so the caller can use the generic fill.
+    still false. Otherwise this tier's own ``open_base`` is its ledger.
+    ``exchange_position_base`` is the shared live size, so a tier never
+    claims more than its own ledger and never more than that shared size.
+    A reported ``sibling_base`` caps the tier at ``live - sibling_base``.
+    With no open base, ``filled_base`` minus ``closed_base`` when both are
+    present. Otherwise ``filled_base``. None when none of those fields were
+    reported, so the caller can use the generic fill.
     """
     close_type = getattr(executor, "close_type", None) if executor is not None else None
     if _range_iceberg_externally_closed(close_type, custom_info):
         return Decimal("0")
     exchange = _reported_decimal(executor, custom_info, "exchange_position_base")
-    if exchange is not None:
-        return exchange if exchange > 0 else Decimal("0")
     open_base = _reported_decimal(executor, custom_info, "open_base")
+    if open_base is not None and (
+        exchange is not None or _sibling_hint_reported(custom_info)
+    ):
+        claim = open_base if open_base > 0 else Decimal("0")
+        if exchange is None:
+            return claim
+        book = exchange if exchange > 0 else Decimal("0")
+        if _sibling_hint_reported(custom_info):
+            sibling = _reported_decimal(executor, custom_info, "sibling_base") or Decimal("0")
+            room = book - sibling
+            if room < 0:
+                room = Decimal("0")
+            return claim if claim < room else room
+        return claim if claim < book else book
     if open_base is not None:
         return open_base if open_base > 0 else Decimal("0")
     filled = _reported_decimal(executor, custom_info, "filled_base")
@@ -576,6 +603,383 @@ def range_iceberg_held_base(executor: Any, custom_info: Any) -> Optional[Decimal
     if filled is not None:
         return filled if filled > 0 else Decimal("0")
     return None
+
+
+def range_iceberg_side_held_base(custom_infos: Any) -> Decimal:
+    """Sum of the tiers on one side, without counting the shared book twice.
+
+    Each tier contributes its own ledger. The shared ``exchange_position_base``
+    is read once. When that live size is below the sum, the total is the
+    live size. An externally closed tier contributes nothing and does not
+    pull the live size down to zero for the tiers that are still open.
+    """
+    if not isinstance(custom_infos, (list, tuple)):
+        custom_infos = [custom_infos]
+    total = Decimal("0")
+    live: Optional[Decimal] = None
+    for custom_info in custom_infos:
+        held = range_iceberg_held_base(None, custom_info)
+        if held is not None:
+            total += held
+        if _range_iceberg_externally_closed(None, custom_info):
+            continue
+        book = _reported_decimal(None, custom_info, "exchange_position_base")
+        if book is None:
+            continue
+        live = book if live is None else min(live, book)
+    if live is not None and live < total:
+        return live
+    return total
+
+
+def range_iceberg_sibling_hints(tiers: List[Dict[str, Any]]) -> Dict[str, Optional[Decimal]]:
+    """Live size each tier must leave for the others. LIFO by creation time.
+
+    One open tier gets ``None``, which is the lone-iceberg rule. Several
+    tiers are shrunk below their own ``open_base`` only when every tier
+    reports the same live size and that size is below the sum of the open
+    bases. The newest tier gives up size first. Each hint is the sum of
+    the other caps, so a sibling fill that has already lowered that
+    sibling's open base does not reserve the old book. A missing open
+    base, a missing book, or books that differ by more than one percent
+    leaves the hints alone: an empty result means do not call
+    ``set_sibling_base``. The same numeric hint is sent again when the
+    shared book moves by more than one percent, because the executor keeps
+    the last captured room until the next hint.
+    """
+    usable = [row for row in tiers if row.get("executor_id")]
+    if len(usable) == 1:
+        return {usable[0]["executor_id"]: None}
+    if len(usable) < 2:
+        return {}
+    books = [
+        row["exchange_position_base"]
+        for row in usable
+        if isinstance(row.get("exchange_position_base"), Decimal)
+    ]
+    if len(books) != len(usable):
+        return {}
+    if any(not isinstance(row.get("open_base"), Decimal) for row in usable):
+        return {}
+    live_max = max(books)
+    live = min(books)
+    if live <= 0 or live_max <= 0:
+        return {}
+    if (live_max - live) / live_max > _PRICE_DISAGREE:
+        return {}
+    # Oldest first. A missing timestamp sorts last, so that tier is reduced first.
+    ordered = sorted(
+        usable,
+        key=lambda row: (
+            1 if row.get("created_at") is None else 0,
+            str(row.get("created_at") or ""),
+            str(row["executor_id"]),
+        ),
+    )
+    opens: List[Decimal] = []
+    for row in ordered:
+        opened = row.get("open_base")
+        if not isinstance(opened, Decimal) or opened < 0:
+            opened = Decimal("0")
+        opens.append(opened)
+    total = sum(opens, Decimal("0"))
+    caps = list(opens)
+    if live < total:
+        shortfall = total - live
+        for index in range(len(caps) - 1, -1, -1):
+            cut = caps[index] if caps[index] < shortfall else shortfall
+            caps[index] -= cut
+            shortfall -= cut
+            if shortfall <= 0:
+                break
+    # Leave the other caps, not "reported live minus own cap". A sibling
+    # fill lowers that sibling's open base before the shared book drops.
+    # live - own cap would reserve the stale book and the next read would
+    # cut an older tier. The two formulas match once the caps sum to live.
+    allocated = sum(caps, Decimal("0"))
+    hints: Dict[str, Optional[Decimal]] = {}
+    for row, cap in zip(ordered, caps):
+        hints[row["executor_id"]] = allocated - cap
+    return hints
+
+
+def _range_iceberg_stop_prices(config: Any, custom: Any) -> set:
+    """Absolute stop prices already claimed by one tier.
+
+    A pending edit counts as well as the running config, and so does a
+    reported trigger. A percent-only stop has no price until that trigger
+    exists. Two tiers at the same price are refused because MEXC would
+    overwrite the quantity of the first stop.
+    """
+    found = set()
+
+    def add_stop(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        stop = source.get("stop_loss")
+        if isinstance(stop, dict):
+            price = _reported_decimal(None, stop, "price")
+            if price is not None:
+                found.add(price)
+
+    add_stop(config)
+    add_stop(custom)
+    for source in (config, custom):
+        if isinstance(source, dict):
+            add_stop(source.get("config_edits"))
+    if isinstance(custom, dict):
+        trigger = _reported_decimal(None, custom, "stop_loss_trigger_price")
+        if trigger is not None:
+            found.add(trigger)
+    return found
+
+
+def _range_iceberg_stop_price(config: Any, custom: Any) -> Optional[Decimal]:
+    """One stop price from a create or a PATCH body."""
+    prices = _range_iceberg_stop_prices(config, custom)
+    if len(prices) == 1:
+        return next(iter(prices))
+    return None
+
+
+def _custom_with_pending_edits(metadata: Any, custom: Any) -> Any:
+    """Attach in-memory config_edits so a stop check sees a PATCH."""
+    edits = metadata.get("config_edits") if isinstance(metadata, dict) else None
+    if not isinstance(edits, dict):
+        return custom
+    merged = dict(custom) if isinstance(custom, dict) else {}
+    merged["config_edits"] = edits
+    return merged
+
+
+def _positive_price(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    try:
+        price = Decimal(str(value))
+    except Exception:
+        return None
+    if not price.is_finite() or price <= 0:
+        return None
+    return price
+
+
+def _tier_number(custom: Any, config: Any, key: str) -> Optional[Decimal]:
+    """A reported figure, with a pending edit ahead of the running config."""
+    for source in (custom, config):
+        if isinstance(source, dict) and isinstance(source.get("config_edits"), dict):
+            edits = source["config_edits"]
+            if key in edits:
+                return _reported_decimal(None, edits, key)
+    reported = _reported_decimal(None, custom, key)
+    if reported is not None:
+        return reported
+    return _reported_decimal(None, config, key)
+
+
+def _resume_entries_off(custom: Any, config: Any, executor: Any = None) -> bool:
+    """A restored exit-only iceberg does not place another entry."""
+    for source in (custom, config):
+        if not isinstance(source, dict) or "resume_entries" not in source:
+            continue
+        value = source.get("resume_entries")
+        if isinstance(value, str):
+            if value.strip().lower() in ("false", "0", "no"):
+                return True
+        elif not value:
+            return True
+    typed = getattr(getattr(executor, "config", None), "resume_entries", None)
+    return typed is False
+
+
+def _tier_held_by_user_or_halt(custom: Any) -> bool:
+    """User pause or an unknown-order halt. Not the coordinator's entry pause.
+
+    ``paused`` is the executor's own pause. ``entry_paused`` is the depth
+    rule. A halt also sets ``unknown_order_halt``. Those tiers stay out of
+    the depth contest, and this coordinator does not resume them.
+    """
+    if not isinstance(custom, dict):
+        return False
+    if custom.get("unknown_order_halt") is True:
+        return True
+    reason = custom.get("status_reason")
+    if isinstance(reason, str) and reason.startswith("unknown_order_halt"):
+        return True
+    if custom.get("paused") is True:
+        note = custom.get("pause_reason")
+        if not (isinstance(note, str) and note.startswith("deeper tier ")):
+            return True
+    return False
+
+
+def _tier_has_unspent_entry(custom: Any, config: Any) -> bool:
+    """True when this tier can still place an entry.
+
+    A missing figure counts as unspent. Only a reported zero remainder, or
+    a filled amount that has reached the total, drops the tier out of the
+    depth rule.
+    """
+    unfilled = _tier_number(custom, config, "unfilled_amount")
+    if unfilled is not None:
+        return unfilled > 0
+    total = _tier_number(custom, config, "total_amount")
+    filled = _tier_number(custom, config, "filled_amount")
+    if total is not None and filled is not None:
+        return total - filled > 0
+    return True
+
+
+def _tier_entry_limit(row: Dict[str, Any], side: str) -> Optional[Decimal]:
+    """Up-to price. A range uses the edge nearer the market.
+
+    A buy range's nearer edge is its high. A sell range's nearer edge is
+    its low. An up-to iceberg uses ``limit_price``.
+    """
+    mode = str(row.get("mode") or "").upper()
+    limit = row.get("limit_price") if isinstance(row.get("limit_price"), Decimal) else None
+    low = row.get("price_low") if isinstance(row.get("price_low"), Decimal) else None
+    high = row.get("price_high") if isinstance(row.get("price_high"), Decimal) else None
+    if mode == "RANGE" or (limit is None and (low is not None or high is not None)):
+        if side == "SELL":
+            return low if low is not None else high
+        return high if high is not None else low
+    return limit
+
+
+def range_iceberg_entry_pauses(
+    tiers: List[Dict[str, Any]],
+    side: str,
+    price: Optional[Decimal],
+) -> Dict[str, Optional[str]]:
+    """Pause reason for each tier, or None when its entries may run.
+
+    Only the deepest tier the price qualifies for stays active. For a buy
+    the price has to be strictly above the next deeper unspent limit. A
+    sell is the mirror: strictly below the next higher limit. A tier with
+    nothing left to buy does not pause the ones above it. One tier is
+    never paused. An unknown price returns nothing, which means do not
+    call ``set_entry_paused``.
+    """
+    if price is None:
+        return {}
+    result: Dict[str, Optional[str]] = {}
+    for row in tiers:
+        executor_id = row.get("executor_id")
+        if not executor_id or row.get("eligible", True) is False:
+            continue
+        result[executor_id] = None
+    if len(result) < 2:
+        return result
+    unspent: List[tuple] = []
+    for row in tiers:
+        if row.get("executor_id") not in result:
+            continue
+        if not row.get("unspent", True):
+            continue
+        limit = _tier_entry_limit(row, side)
+        if limit is None:
+            continue
+        unspent.append((row, limit))
+    if len(unspent) < 2:
+        return result
+    if side == "SELL":
+        unspent.sort(key=lambda item: (item[1], str(item[0]["executor_id"])))
+    else:
+        unspent.sort(key=lambda item: (-item[1], str(item[0]["executor_id"])))
+    for index, (row, limit) in enumerate(unspent):
+        qualifies = price >= limit if side == "SELL" else price <= limit
+        if not qualifies or index + 1 >= len(unspent):
+            continue
+        deeper, deeper_limit = unspent[index + 1]
+        blocked = price >= deeper_limit if side == "SELL" else price <= deeper_limit
+        if blocked:
+            result[row["executor_id"]] = f"deeper tier {deeper['executor_id']} active"
+    return result
+
+
+def _read_mid_price(connector: Any, trading_pair: str) -> Optional[Decimal]:
+    if connector is None or not trading_pair:
+        return None
+    mid = getattr(connector, "get_mid_price", None)
+    if callable(mid):
+        try:
+            price = _positive_price(mid(trading_pair))
+        except Exception:
+            price = None
+        if price is not None:
+            return price
+    by_type = getattr(connector, "get_price_by_type", None)
+    if callable(by_type):
+        try:
+            return _positive_price(by_type(trading_pair, PriceType.MidPrice))
+        except Exception:
+            return None
+    return None
+
+
+def _read_mark_price(connector: Any, trading_pair: str) -> Optional[Decimal]:
+    if connector is None or not trading_pair:
+        return None
+    funding = getattr(connector, "get_funding_info", None)
+    if not callable(funding):
+        return None
+    try:
+        info = funding(trading_pair)
+    except Exception:
+        return None
+    if info is None:
+        return None
+    return _positive_price(getattr(info, "mark_price", None))
+
+
+def _reported_entry_pause_matches(row: Dict[str, Any], desired: Optional[str]) -> Optional[bool]:
+    """Whether the executor already shows this decision.
+
+    None when the executor does not report ``entry_paused`` yet. False when
+    the report disagrees, so a lost pause is sent again.
+    """
+    if not row.get("reports_entry_pause"):
+        return None
+    paused = row.get("entry_paused") is True
+    want_pause = desired is not None
+    if paused != want_pause:
+        return False
+    if want_pause and row.get("pause_reason") != desired:
+        return False
+    return True
+
+
+def _choose_reference_price(
+    mid: Optional[Decimal],
+    mark: Optional[Decimal],
+    had_mid: bool,
+) -> Optional[Decimal]:
+    """Mid when it agrees with the mark. A failed mid does not switch sources.
+
+    Mid and mark more than one percent apart is an unknown price, so a
+    frozen book cannot move the pause. After a mid has been seen, a later
+    miss stays unknown instead of falling through to the mark for a poll.
+    """
+    if mid is not None and mark is not None:
+        base = mark if mark > 0 else mid
+        if base > 0 and abs(mid - mark) / base > _PRICE_DISAGREE:
+            return None
+        return mid
+    if mid is not None:
+        return mid
+    if had_mid:
+        return None
+    return mark
+
+
+def _connector_reference_price(connector: Any, trading_pair: str) -> Optional[Decimal]:
+    """Mid price, or the mark when this connector has never produced a mid."""
+    return _choose_reference_price(
+        _read_mid_price(connector, trading_pair),
+        _read_mark_price(connector, trading_pair),
+        False,
+    )
 
 
 def _stored_position_hold_keeps_slot(custom_info: Any) -> bool:
@@ -1005,6 +1409,12 @@ class ExecutorService:
         # system clock step cannot stall the series or flood it).
         self._last_snapshot_at: float = 0.0
         self._last_prune_at: float = 0.0
+
+        # Last entry-pause decision sent to each range iceberg, and the
+        # consecutive polls that have wanted a different one. Restart starts
+        # both empty, so the next two agreeing prices are sent again.
+        self._entry_pause_sent: Dict[str, Optional[str]] = {}
+        self._entry_pause_streak: Dict[str, tuple] = {}
 
         # Control loop task
         self._control_loop_task: Optional[asyncio.Task] = None
@@ -2724,6 +3134,9 @@ class ExecutorService:
                 for executor_id in completed_ids:
                     await self._handle_executor_completion(executor_id)
 
+                self._sync_range_iceberg_sibling_hints()
+                self._sync_range_iceberg_entry_pauses()
+
                 # Performance snapshots, after completion handling so a just-closed
                 # executor is already out of _active_executors and gets only its terminal
                 # row, not a duplicate periodic one. This is not a separate task on
@@ -3274,14 +3687,16 @@ class ExecutorService:
             return _range_iceberg_side_name(custom.get("side"))
         return "BUY"
 
-    def _range_iceberg_memory_occupant(self, slot: tuple) -> Optional[str]:
-        """Id of a live in-memory range iceberg on this slot, if any."""
+    def _range_iceberg_memory_rows(self, slot: tuple) -> List[Dict[str, Any]]:
+        """Live in-memory range icebergs on this slot, excluding an external close."""
         account, connector, pair, side = slot
+        rows: List[Dict[str, Any]] = []
         for executor_id, executor in self._active_executors.items():
             if self._executor_is_closed(executor):
                 continue
+            custom = self._safe_custom_info(executor)
             close_name = getattr(getattr(executor, "close_type", None), "name", None)
-            if _range_iceberg_externally_closed(close_name, self._safe_custom_info(executor)):
+            if _range_iceberg_externally_closed(close_name, custom):
                 continue
             meta = self._executor_metadata.get(executor_id, {})
             if meta.get("executor_type") != "range_iceberg_executor":
@@ -3297,11 +3712,17 @@ class ExecutorService:
             if stored_side in (None, ""):
                 stored_side = getattr(getattr(executor, "config", None), "side", None)
             if stored_side in (None, ""):
-                info = self._safe_custom_info(executor)
-                stored_side = info.get("side")
-            if _range_iceberg_side_name(stored_side) == side:
-                return executor_id
-        return None
+                stored_side = custom.get("side")
+            if _range_iceberg_side_name(stored_side) != side:
+                continue
+            rows.append({
+                "executor_id": executor_id,
+                "config": config,
+                "custom": _custom_with_pending_edits(meta, custom),
+                "created_at": meta.get("created_at"),
+                "executor": executor,
+            })
+        return rows
 
     def _executor_id_is_live(self, executor_id: str) -> bool:
         executor = self._active_executors.get(executor_id)
@@ -3401,78 +3822,128 @@ class ExecutorService:
             return True
         return await self._exchange_stops_are_live(slot, custom_info)
 
-    def _range_iceberg_conflict(self, slot: tuple, occupant: str) -> HTTPException:
+    def _range_iceberg_cap_conflict(self, slot: tuple) -> HTTPException:
         account, _connector, pair, side = slot
         detail = (
-            f"A range iceberg is already open on {pair} {side} for {account} "
-            f"(executor {occupant}). Close it first."
+            f"{_RANGE_ICEBERG_OPEN_CAP} range icebergs are already open on "
+            f"{pair} {side} for {account}. Close one first."
         )
         logger.info("%s", detail)
         return HTTPException(status_code=409, detail=detail)
 
-    async def _assert_range_iceberg_slot_free(self, slot: tuple) -> None:
-        """Reject a second open range iceberg on this account, connector, pair, and side.
+    def _range_iceberg_stop_conflict(
+        self,
+        slot: tuple,
+        price: Decimal,
+        other_id: str,
+    ) -> HTTPException:
+        account, _connector, pair, side = slot
+        detail = (
+            f"Stop price {price} is already used by range iceberg {other_id} "
+            f"on {pair} {side} for {account}. "
+            "MEXC would overwrite that stop quantity. Use a different stop price."
+        )
+        logger.info("%s", detail)
+        return HTTPException(status_code=409, detail=detail)
 
-        A live executor holds the slot. So does a TERMINATED POSITION_HOLD row
-        that still has base or an exchange stop, until the exchange position
-        on that side is flat or the row is marked slot_released.
+    async def _range_iceberg_open_rows(self, slot: tuple) -> List[Dict[str, Any]]:
+        """Open range icebergs on this slot, one row per executor.
+
+        A live executor counts. So does a TERMINATED POSITION_HOLD row that
+        still has base or an exchange stop, until the exchange position on
+        that side is flat or the row is marked slot_released.
         POSITION_CLOSED_EXTERNALLY does not, even when open_base is still
         above zero, and neither does a row whose custom_info says
-        external_close. A RUNNING row that is not in memory holds the slot
-        unless that side is flat and has no live stop. A long and a short
-        are different slots, and so is the same side on another account.
+        external_close. A RUNNING row that is not in memory counts unless
+        that side is flat and has no live stop. A long and a short are
+        different slots, and so is the same side on another account.
         """
-        occupant = self._range_iceberg_memory_occupant(slot)
-        if occupant is None:
-            rows = await self._range_iceberg_slot_rows(slot)
-            # One position refresh for this create, shared by every parked row.
-            flat_known = False
-            flat = False
+        open_rows = self._range_iceberg_memory_rows(slot)
+        seen = {row["executor_id"] for row in open_rows}
+        stored = await self._range_iceberg_slot_rows(slot)
+        flat_known = False
+        flat = False
 
-            async def side_is_flat() -> bool:
-                nonlocal flat_known, flat
-                if not flat_known:
-                    snapshot = await self._exchange_side_is_flat(slot)
-                    flat = snapshot
-                    flat_known = True
-                return flat
+        async def side_is_flat() -> bool:
+            nonlocal flat_known, flat
+            if not flat_known:
+                flat = await self._exchange_side_is_flat(slot)
+                flat_known = True
+            return flat
 
-            for row in rows:
-                executor_id, status, close_type, _pair, _config, final_state = row
-                if self._executor_id_is_live(executor_id):
-                    # The object can already be externally closed while its
-                    # stored row is still RUNNING and external_close is false.
-                    live = self._active_executors.get(executor_id)
-                    if _range_iceberg_externally_closed(
-                        getattr(live, "close_type", None),
-                        self._safe_custom_info(live),
-                    ):
-                        continue
-                    occupant = executor_id
-                    break
-                custom = _parse_stored_custom_info(final_state)
-                if custom.get("slot_released") is True:
+        for row in stored:
+            executor_id, status, close_type, _pair, config_raw, final_state = row
+            if executor_id in seen:
+                continue
+            if self._executor_id_is_live(executor_id):
+                live = self._active_executors.get(executor_id)
+                if _range_iceberg_externally_closed(
+                    getattr(live, "close_type", None),
+                    self._safe_custom_info(live),
+                ):
                     continue
-                # An external close is finished. open_base can still be the
-                # old size, and a stale RUNNING row can still say so.
-                if _range_iceberg_externally_closed(close_type, custom):
+                live_meta = self._executor_metadata.get(executor_id, {})
+                open_rows.append({
+                    "executor_id": executor_id,
+                    "config": live_meta.get("config") if isinstance(live_meta.get("config"), dict) else {},
+                    "custom": _custom_with_pending_edits(live_meta, self._safe_custom_info(live)),
+                    "created_at": live_meta.get("created_at"),
+                    "executor": live,
+                })
+                seen.add(executor_id)
+                continue
+            custom = _parse_stored_custom_info(final_state)
+            if custom.get("slot_released") is True:
+                continue
+            if _range_iceberg_externally_closed(close_type, custom):
+                continue
+            if (status or "") != "TERMINATED":
+                if not await self._stale_range_iceberg_blocks(slot, custom, await side_is_flat()):
                     continue
-                if (status or "") != "TERMINATED":
-                    if await self._stale_range_iceberg_blocks(slot, custom, await side_is_flat()):
-                        occupant = executor_id
-                        break
-                    continue
-                if close_type != "POSITION_HOLD":
-                    continue
-                if not _stored_position_hold_keeps_slot(custom):
-                    continue
-                if await side_is_flat():
-                    continue
-                occupant = executor_id
-                break
-        if occupant is None:
+            elif close_type != "POSITION_HOLD":
+                continue
+            elif not _stored_position_hold_keeps_slot(custom):
+                continue
+            elif await side_is_flat():
+                continue
+            config = {}
+            if isinstance(config_raw, str) and config_raw:
+                try:
+                    parsed = json.loads(config_raw)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    config = parsed
+            open_rows.append({
+                "executor_id": executor_id,
+                "config": config,
+                "custom": custom,
+                "created_at": None,
+                "executor": None,
+            })
+            seen.add(executor_id)
+        return open_rows
+
+    async def _assert_range_iceberg_slot_free(self, slot: tuple) -> None:
+        """Reject an 11th open range iceberg on this account, connector, pair, and side."""
+        open_rows = await self._range_iceberg_open_rows(slot)
+        if len(open_rows) >= _RANGE_ICEBERG_OPEN_CAP:
+            raise self._range_iceberg_cap_conflict(slot)
+
+    async def _assert_range_iceberg_stop_price_free(
+        self,
+        slot: tuple,
+        price: Optional[Decimal],
+        exclude_id: Optional[str],
+    ) -> None:
+        """Refuse a stop price another open tier on this side already uses."""
+        if price is None:
             return
-        raise self._range_iceberg_conflict(slot, occupant)
+        for row in await self._range_iceberg_open_rows(slot):
+            if exclude_id and row["executor_id"] == exclude_id:
+                continue
+            if price in _range_iceberg_stop_prices(row.get("config"), row.get("custom")):
+                raise self._range_iceberg_stop_conflict(slot, price, row["executor_id"])
 
     async def release_range_iceberg_slot(
         self,
@@ -3594,6 +4065,7 @@ class ExecutorService:
                     status_code=404,
                     detail=f"Executor {executor_id} is not a range iceberg",
                 )
+            await self._reject_duplicate_range_iceberg_stop(executor_id, metadata, changes)
             editor = getattr(executor, "update_config", None)
             if not callable(editor):
                 raise HTTPException(
@@ -3651,6 +4123,13 @@ class ExecutorService:
         object is what a restart reads, in the executor's own size unit.
         """
         stored = {key: _json_edit_value(value) for key, value in changes.items()}
+        meta = self._executor_metadata.get(executor_id)
+        if isinstance(meta, dict):
+            edits = meta.get("config_edits")
+            if not isinstance(edits, dict):
+                edits = {}
+            edits.update(stored)
+            meta["config_edits"] = edits
         if not getattr(self, "db_manager", None):
             return
         try:
@@ -3697,10 +4176,11 @@ class ExecutorService:
             Dictionary with executor_id and initial status
 
         Raises:
-            HTTPException: 409 when a range iceberg is already open on the same
-            account, connector, trading pair, and side. The detail names that
-            executor. A parked POSITION_HOLD still holds the slot until the
-            exchange position is flat or the slot is released.
+            HTTPException: 409 when 10 range icebergs are already open on the
+            same account, connector, trading pair, and side, or when the new
+            stop price matches another open tier on that side. An external
+            close does not count. A parked POSITION_HOLD still counts until
+            the exchange position is flat or the slot is released.
         """
         account = account_name or self.default_account
         trading_interface = self._get_trading_interface(account)
@@ -3754,6 +4234,9 @@ class ExecutorService:
             # The lock is per process (single uvicorn worker).
             async with self._range_iceberg_slot_lock(slot):
                 await self._assert_range_iceberg_slot_free(slot)
+                await self._assert_range_iceberg_stop_price_free(
+                    slot, _range_iceberg_stop_price(executor_config, None), None,
+                )
                 executor_id, executor = await _register_and_persist()
 
         # Capture created_at before potential cleanup
@@ -3775,6 +4258,331 @@ class ExecutorService:
             "status": executor.status.name,
             "created_at": created_at
         }
+
+    async def _reject_duplicate_range_iceberg_stop(
+        self,
+        executor_id: str,
+        metadata: Dict[str, Any],
+        changes: Dict[str, Any],
+    ) -> None:
+        """Refuse a PATCH that lands on another open tier's stop price."""
+        if "stop_loss" not in changes:
+            return
+        stop = changes.get("stop_loss")
+        if stop is None:
+            return
+        price = _range_iceberg_stop_price({"stop_loss": stop}, None)
+        if price is None:
+            return
+        slot = (
+            metadata.get("account_name") or "",
+            metadata.get("connector_name") or "",
+            _normalize_trading_pair(metadata.get("trading_pair") or ""),
+            _range_iceberg_side_name(
+                (metadata.get("config") or {}).get("side")
+                if isinstance(metadata.get("config"), dict) else None
+            ),
+        )
+        async with self._range_iceberg_slot_lock(slot):
+            await self._assert_range_iceberg_stop_price_free(slot, price, executor_id)
+
+    def _sync_range_iceberg_sibling_hints(self) -> None:
+        """Push a sibling hint to every open range iceberg when the book is known.
+
+        LIFO by creation time. One tier gets None. Several tiers shrink below
+        their own open base only when the shared live size is smaller than
+        the sum of those open bases. A missing or flat book is left alone.
+        """
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for executor_id, executor in self._active_executors.items():
+            if self._executor_is_closed(executor):
+                continue
+            meta = self._executor_metadata.get(executor_id, {})
+            if meta.get("executor_type") != "range_iceberg_executor":
+                continue
+            custom = self._safe_custom_info(executor)
+            close_name = getattr(getattr(executor, "close_type", None), "name", None)
+            if _range_iceberg_externally_closed(close_name, custom):
+                continue
+            config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+            side = config.get("side")
+            if side in (None, ""):
+                side = getattr(getattr(executor, "config", None), "side", None)
+            if side in (None, ""):
+                side = custom.get("side")
+            slot = (
+                meta.get("account_name") or "",
+                meta.get("connector_name") or "",
+                _normalize_trading_pair(meta.get("trading_pair") or ""),
+                _range_iceberg_side_name(side),
+            )
+            groups.setdefault(slot, []).append({
+                "executor_id": executor_id,
+                "executor": executor,
+                "created_at": meta.get("created_at"),
+                "open_base": _reported_decimal(executor, custom, "open_base"),
+                "exchange_position_base": _reported_decimal(
+                    executor, custom, "exchange_position_base",
+                ),
+            })
+        sent = getattr(self, "_sibling_hint_sent", None)
+        if sent is None:
+            sent = {}
+            self._sibling_hint_sent = sent
+        last_live = getattr(self, "_sibling_hint_live", None)
+        if last_live is None:
+            last_live = {}
+            self._sibling_hint_live = last_live
+        for slot, rows in groups.items():
+            hints = range_iceberg_sibling_hints(rows)
+            if not hints:
+                continue
+            books = [
+                row["exchange_position_base"]
+                for row in rows
+                if isinstance(row.get("exchange_position_base"), Decimal)
+            ]
+            live = min(books) if books and len(books) == len(rows) else None
+            previous = last_live.get(slot)
+            live_moved = (
+                live is not None
+                and isinstance(previous, Decimal)
+                and previous > 0
+                and abs(live - previous) / previous > _PRICE_DISAGREE
+            )
+            for row in rows:
+                executor_id = row["executor_id"]
+                if executor_id not in hints:
+                    continue
+                hint = hints[executor_id]
+                if (
+                    executor_id in sent
+                    and sent[executor_id] == hint
+                    and (hint is None or not live_moved)
+                ):
+                    continue
+                setter = getattr(row["executor"], "set_sibling_base", None)
+                if not callable(setter):
+                    continue
+                try:
+                    setter(hint)
+                except Exception as error:
+                    logger.warning(
+                        "Could not set sibling_base on %s: %s",
+                        executor_id, error,
+                    )
+                    continue
+                sent[executor_id] = hint
+            if isinstance(live, Decimal):
+                last_live[slot] = live
+
+    def _range_iceberg_reference_price(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+    ) -> Optional[Decimal]:
+        connector = self._account_connector(account_name, connector_name)
+        mid = _read_mid_price(connector, trading_pair)
+        mark = _read_mark_price(connector, trading_pair)
+        seen = getattr(self, "_reference_mid_seen", None)
+        if seen is None:
+            seen = set()
+            self._reference_mid_seen = seen
+        key = (account_name, connector_name, trading_pair)
+        price = _choose_reference_price(mid, mark, key in seen)
+        if mid is not None:
+            seen.add(key)
+        return price
+
+    def _sync_range_iceberg_entry_pauses(self) -> None:
+        """Pause every tier except the deepest one the price still qualifies for.
+
+        A change is sent after two agreeing polls, so a price that flickers
+        on a boundary does not cancel and replace. The first two agreeing
+        polls after a restart send again. An unknown price leaves the last
+        decision in place.
+        """
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for executor_id, executor in self._active_executors.items():
+            if self._executor_is_closed(executor):
+                continue
+            meta = self._executor_metadata.get(executor_id, {})
+            if meta.get("executor_type") != "range_iceberg_executor":
+                continue
+            custom = _custom_with_pending_edits(meta, self._safe_custom_info(executor))
+            close_name = getattr(getattr(executor, "close_type", None), "name", None)
+            if _range_iceberg_externally_closed(close_name, custom):
+                continue
+            config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+            side = config.get("side")
+            if side in (None, ""):
+                side = getattr(getattr(executor, "config", None), "side", None)
+            if side in (None, ""):
+                side = custom.get("side") if isinstance(custom, dict) else None
+            side_name = _range_iceberg_side_name(side)
+            pair_text = meta.get("trading_pair") or ""
+            slot = (
+                meta.get("account_name") or "",
+                meta.get("connector_name") or "",
+                _normalize_trading_pair(pair_text),
+                side_name,
+            )
+            groups.setdefault(slot, []).append({
+                "executor_id": executor_id,
+                "executor": executor,
+                "trading_pair": pair_text,
+                "mode": (
+                    (custom.get("mode") if isinstance(custom, dict) else None)
+                    or config.get("mode")
+                ),
+                "limit_price": _tier_number(custom, config, "limit_price"),
+                "price_low": _tier_number(custom, config, "price_low"),
+                "price_high": _tier_number(custom, config, "price_high"),
+                "unspent": _tier_has_unspent_entry(custom, config),
+                "eligible": not (
+                    _resume_entries_off(custom, config, executor)
+                    or _tier_held_by_user_or_halt(custom)
+                ),
+                "entry_paused": custom.get("entry_paused") if isinstance(custom, dict) else None,
+                "pause_reason": custom.get("pause_reason") if isinstance(custom, dict) else None,
+                "reports_entry_pause": (
+                    isinstance(custom, dict) and "entry_paused" in custom
+                ),
+            })
+        prices: Dict[tuple, Optional[Decimal]] = {}
+        for slot, rows in groups.items():
+            account, connector, _pair, side_name = slot
+            pair_text = next((row["trading_pair"] for row in rows if row.get("trading_pair")), "")
+            price_key = (account, connector, pair_text)
+            if price_key not in prices:
+                prices[price_key] = self._range_iceberg_reference_price(
+                    account, connector, pair_text,
+                )
+            price = prices[price_key]
+            if price is None:
+                continue
+            decisions = range_iceberg_entry_pauses(rows, side_name, price)
+            self._apply_entry_pause_decisions(rows, decisions)
+
+    def _apply_entry_pause_decisions(
+        self,
+        rows: List[Dict[str, Any]],
+        decisions: Dict[str, Optional[str]],
+    ) -> None:
+        sent = getattr(self, "_entry_pause_sent", None)
+        streak = getattr(self, "_entry_pause_streak", None)
+        if sent is None or streak is None:
+            sent = {}
+            streak = {}
+            self._entry_pause_sent = sent
+            self._entry_pause_streak = streak
+        by_id = {row["executor_id"]: row for row in rows}
+        for executor_id, desired in decisions.items():
+            row = by_id.get(executor_id, {})
+            reported = _reported_entry_pause_matches(row, desired)
+            if (
+                executor_id in sent
+                and sent[executor_id] == desired
+                and reported is not False
+            ):
+                streak.pop(executor_id, None)
+                continue
+            previous, count = streak.get(executor_id, (None, 0))
+            if executor_id not in streak:
+                count = 1
+            elif previous == desired:
+                count += 1
+            else:
+                count = 1
+            if count < _ENTRY_PAUSE_DWELL:
+                streak[executor_id] = (desired, count)
+                continue
+            if self._set_entry_paused(row.get("executor"), desired):
+                sent[executor_id] = desired
+            streak.pop(executor_id, None)
+
+    def _set_entry_paused(self, executor: Any, desired: Optional[str]) -> bool:
+        setter = getattr(executor, "set_entry_paused", None)
+        if not callable(setter):
+            return False
+        try:
+            if desired is None:
+                setter(False, None)
+            else:
+                setter(True, desired)
+        except Exception as error:
+            logger.warning("Could not set entry pause: %s", error)
+            return False
+        return True
+
+    def _range_iceberg_booked_share(
+        self,
+        executor_id: str,
+        metadata: Dict[str, Any],
+        custom_info: Any,
+        claim: Decimal,
+    ) -> Decimal:
+        """How much of ``claim`` this tier may add without counting the book twice.
+
+        Other open tiers on the same side keep their own ledgers. This tier
+        gets what remains of the shared live size. A missing live size books
+        the claim.
+        """
+        if claim <= 0:
+            return claim
+        account = metadata.get("account_name") or self.default_account
+        connector = metadata.get("connector_name") or ""
+        pair = _normalize_trading_pair(metadata.get("trading_pair") or "")
+        config = metadata.get("config") if isinstance(metadata.get("config"), dict) else {}
+        side = _range_iceberg_side_name(
+            config.get("side") or (custom_info.get("side") if isinstance(custom_info, dict) else None)
+        )
+        live = _reported_decimal(None, custom_info, "exchange_position_base")
+        other_claims = Decimal("0")
+        for other_id, other in self._active_executors.items():
+            if other_id == executor_id:
+                continue
+            meta = self._executor_metadata.get(other_id, {})
+            if meta.get("executor_type") != "range_iceberg_executor":
+                continue
+            if (meta.get("account_name") or "") != (account or ""):
+                continue
+            if (meta.get("connector_name") or "") != connector:
+                continue
+            if _normalize_trading_pair(meta.get("trading_pair") or "") != pair:
+                continue
+            other_custom = self._safe_custom_info(other)
+            other_config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+            other_side = _range_iceberg_side_name(
+                other_config.get("side") or other_custom.get("side")
+            )
+            if other_side != side:
+                continue
+            if _range_iceberg_externally_closed(
+                getattr(getattr(other, "close_type", None), "name", None),
+                other_custom,
+            ):
+                continue
+            book = _reported_decimal(None, other_custom, "exchange_position_base")
+            if book is not None:
+                live = book if live is None else min(live, book)
+            held = range_iceberg_held_base(other, other_custom)
+            if held is not None and held > 0:
+                other_claims += held
+        if live is None:
+            return claim
+        already = Decimal("0")
+        for position in self._positions_held.values():
+            if position.account_name != account or position.connector_name != connector:
+                continue
+            if _normalize_trading_pair(position.trading_pair) != pair:
+                continue
+            already += position.buy_amount_base if side == "BUY" else position.sell_amount_base
+        room = live - other_claims - already
+        if room < 0:
+            room = Decimal("0")
+        return claim if claim < room else room
 
     async def get_executors(
         self,
@@ -3802,6 +4610,7 @@ class ExecutorService:
         Returns:
             List of executor information dictionaries
         """
+        self._sync_range_iceberg_sibling_hints()
         result = []
 
         # Process active executors from memory
@@ -3862,6 +4671,7 @@ class ExecutorService:
             Detailed executor information or None if not found
         """
         # Check active executors first (memory)
+        self._sync_range_iceberg_sibling_hints()
         executor = self._active_executors.get(executor_id)
         if executor:
             return self._format_executor_info(executor_id, executor)
@@ -4781,6 +5591,12 @@ class ExecutorService:
                 # Quote follows the open base, not the full entry quote.
                 held_quote = range_iceberg_held_quote(executor, custom_info, filled_amount_base)
                 filled_amount_quote = held_quote if held_quote is not None else Decimal("0")
+                share = self._range_iceberg_booked_share(
+                    executor_id, metadata, custom_info, filled_amount_base,
+                )
+                if filled_amount_base > 0 and share < filled_amount_base:
+                    filled_amount_quote = filled_amount_quote * share / filled_amount_base
+                    filled_amount_base = share
 
             if not used_iceberg_base and hasattr(executor, 'filled_amount_base'):
                 filled_amount_base = Decimal(str(executor.filled_amount_base or 0))
