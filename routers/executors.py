@@ -60,6 +60,10 @@ async def create_executor(
     - Additional type-specific configuration (see /executors/types/{type}/config for details)
 
     Returns the created executor ID and initial status.
+
+    A second range iceberg on the same account, connector, trading pair, and
+    side is rejected with 409. A long and a short on the same pair are both
+    allowed, and so is the same side on a different account.
     """
     try:
         result = await executor_service.create_executor(

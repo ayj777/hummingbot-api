@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -1955,3 +1956,128 @@ def test_resume_payload_keeps_exchange_stop_released():
     )
     assert absent.get("exchange_stop_released") in (None, False)
     assert absent["exit"].get("exchange_stop_released") in (None, False)
+
+
+_OPEN_IDS = iter(range(1, 10_000))
+
+
+class _OpenConfig:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        if not getattr(self, "id", None):
+            self.id = f"open-{next(_OPEN_IDS)}"
+
+
+class _OpenExecutor:
+    def __init__(self, strategy, config, update_interval, max_retries):
+        self.config = config
+        self.is_closed = False
+        self.status = SimpleNamespace(name="RUNNING")
+        self.close_type = None
+
+    def start(self):
+        return None
+
+    def get_custom_info(self):
+        return {"side": getattr(self.config, "side", "BUY")}
+
+
+def _open_service(db):
+    service = _service(db)
+    service.update_interval = 1.0
+    service.max_retries = 10
+    service.EXECUTOR_REGISTRY = dict(ExecutorService.EXECUTOR_REGISTRY)
+    service.EXECUTOR_REGISTRY["range_iceberg_executor"] = (_OpenExecutor, _OpenConfig)
+    service._get_trading_interface = lambda account: SimpleNamespace(current_timestamp=1.0)
+
+    async def _prepare(*_args, **_kwargs):
+        return None
+
+    service._prepare_market = _prepare
+    return service
+
+
+def _open_config(side, pair="BTC-USDT", connector="mexc_perpetual"):
+    return {
+        "type": "range_iceberg_executor",
+        "connector_name": connector,
+        "trading_pair": pair,
+        "side": side,
+        "total_amount": "1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_second_long_is_rejected_including_a_parked_executor(db):
+    await _seed_iceberg_row(
+        db,
+        "parked-long",
+        {"side": "LONG", "exit_state": "RESTING", "resume_on_startup": True, "open_base": "1"},
+        config={
+            "type": "range_iceberg_executor",
+            "connector_name": "mexc_perpetual",
+            "trading_pair": "BTC-USDT",
+            "side": "LONG",
+        },
+    )
+    service = _open_service(db)
+    assert "parked-long" not in service._active_executors
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert caught.value.detail == (
+        "A range iceberg is already open on BTC-USDT BUY for master. Close it first."
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_and_short_on_the_same_pair_are_both_allowed(db):
+    service = _open_service(db)
+    buy = await service.create_executor(_open_config("BUY"), account_name="master")
+    sell = await service.create_executor(_open_config("SELL"), account_name="master")
+    assert buy["executor_id"] != sell["executor_id"]
+    assert buy["executor_id"] in service._active_executors
+    assert sell["executor_id"] in service._active_executors
+
+
+@pytest.mark.asyncio
+async def test_range_iceberg_is_allowed_after_the_first_terminates(db):
+    service = _open_service(db)
+    first = await service.create_executor(_open_config("BUY"), account_name="master")
+    service._active_executors.pop(first["executor_id"], None)
+    service._executor_metadata.pop(first["executor_id"], None)
+    async with db.session_context() as session:
+        await ExecutorRepository(session).update_executor(
+            first["executor_id"], status="TERMINATED", close_type="EARLY_STOP"
+        )
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != first["executor_id"]
+
+
+@pytest.mark.asyncio
+async def test_range_iceberg_on_another_account_is_allowed(db):
+    service = _open_service(db)
+    first = await service.create_executor(_open_config("BUY"), account_name="master")
+    other = await service.create_executor(_open_config("BUY"), account_name="other")
+    assert other["executor_id"] != first["executor_id"]
+    assert service._executor_metadata[other["executor_id"]]["account_name"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_range_iceberg_creates_only_one_succeeds(db):
+    service = _open_service(db)
+    results = await asyncio.gather(
+        service.create_executor(_open_config("BUY"), account_name="master"),
+        service.create_executor(_open_config("BUY"), account_name="master"),
+        return_exceptions=True,
+    )
+    created = [row for row in results if isinstance(row, dict)]
+    rejected = [row for row in results if isinstance(row, HTTPException)]
+    assert len(created) == 1
+    assert len(rejected) == 1
+    assert rejected[0].status_code == 409
+    assert rejected[0].detail == (
+        "A range iceberg is already open on BTC-USDT BUY for master. Close it first."
+    )
+    rows = [row for row in db.query(ExecutorRecord) if row.trading_pair == "BTC-USDT" and row.status == "RUNNING"]
+    assert len(rows) == 1

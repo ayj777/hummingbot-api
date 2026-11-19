@@ -257,6 +257,28 @@ class ExecutorRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_open_executors_for_pair(
+            self,
+            executor_type: str,
+            account_name: str,
+            connector_name: str,
+            trading_pair: str,
+    ) -> List[ExecutorRecord]:
+        """Executors on this pair that have not terminated.
+
+        RUNNING covers a parked range iceberg that still holds a position.
+        Any other non-terminal status blocks a new one on the same slot too.
+        """
+        stmt = select(ExecutorRecord).where(
+            ExecutorRecord.executor_type == executor_type,
+            ExecutorRecord.account_name == account_name,
+            ExecutorRecord.connector_name == connector_name,
+            ExecutorRecord.trading_pair == trading_pair,
+            ExecutorRecord.status != "TERMINATED",
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_position_hold_executors(
             self,
             account_name: Optional[str] = None,

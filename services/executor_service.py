@@ -235,6 +235,19 @@ def _exchange_stop_text(custom_info: Any) -> str:
     return ", ".join(ids) if ids else "none"
 
 
+def _range_iceberg_side_name(value: Any) -> str:
+    """Position side for the one-open-iceberg slot.
+
+    BUY and LONG are one side. SELL and SHORT are the other. A missing
+    side counts as BUY, which is the executor default.
+    """
+    name = getattr(value, "name", value)
+    text = str(name or "").strip().upper()
+    if text in {"SELL", "SHORT"}:
+        return "SELL"
+    return "BUY"
+
+
 def _open_base_is_zero(custom_info: Any) -> bool:
     """True when ``open_base`` is present and zero.
 
@@ -701,6 +714,10 @@ class ExecutorService:
         # Control loop task
         self._control_loop_task: Optional[asyncio.Task] = None
         self._is_running = False
+
+        # One lock per (account, connector, pair, side) so two creates of a
+        # range iceberg on that slot cannot both pass the open check.
+        self._range_iceberg_slot_locks: Dict[tuple, asyncio.Lock] = {}
 
     def start(self):
         """Start the executor service control loop."""
@@ -2772,6 +2789,91 @@ class ExecutorService:
 
         return executor_id, executor
 
+    def _range_iceberg_slot_lock(self, slot: tuple) -> asyncio.Lock:
+        """The lock for one account, connector, pair, and side."""
+        locks = getattr(self, "_range_iceberg_slot_locks", None)
+        if locks is None:
+            locks = {}
+            self._range_iceberg_slot_locks = locks
+        lock = locks.get(slot)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[slot] = lock
+        return lock
+
+    @staticmethod
+    def _range_iceberg_side_of_stored(config_raw: Any, final_state: Any) -> str:
+        """Side of a stored executor. Config wins, then the saved custom_info."""
+        if isinstance(config_raw, str) and config_raw:
+            try:
+                parsed = json.loads(config_raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("side") not in (None, ""):
+                return _range_iceberg_side_name(parsed.get("side"))
+        custom = _parse_stored_custom_info(final_state)
+        if custom.get("side") not in (None, ""):
+            return _range_iceberg_side_name(custom.get("side"))
+        return "BUY"
+
+    def _range_iceberg_memory_occupant(self, slot: tuple) -> Optional[str]:
+        """Id of a live in-memory range iceberg on this slot, if any."""
+        account, connector, pair, side = slot
+        for executor_id, executor in self._active_executors.items():
+            if self._executor_is_closed(executor):
+                continue
+            meta = self._executor_metadata.get(executor_id, {})
+            if meta.get("executor_type") != "range_iceberg_executor":
+                continue
+            if (meta.get("account_name") or "") != account:
+                continue
+            if (meta.get("connector_name") or "") != connector:
+                continue
+            if (meta.get("trading_pair") or "") != pair:
+                continue
+            config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+            stored_side = config.get("side")
+            if stored_side in (None, ""):
+                stored_side = getattr(getattr(executor, "config", None), "side", None)
+            if stored_side in (None, ""):
+                info = self._safe_custom_info(executor)
+                stored_side = info.get("side")
+            if _range_iceberg_side_name(stored_side) == side:
+                return executor_id
+        return None
+
+    async def _assert_range_iceberg_slot_free(self, slot: tuple) -> None:
+        """Reject a second open range iceberg on this account, connector, pair, and side.
+
+        A row that is not TERMINATED still holds the slot. That includes a
+        parked executor that is only in the database. A long and a short are
+        different slots, and so is the same side on another account.
+        """
+        occupant = self._range_iceberg_memory_occupant(slot)
+        if occupant is None and self.db_manager:
+            account, connector, pair, side = slot
+            # Copy the columns before the session closes. A later read of a
+            # detached row cannot see config or final_state.
+            stored: List[tuple] = []
+            async with self.db_manager.get_session_context() as session:
+                records = await ExecutorRepository(session).get_open_executors_for_pair(
+                    "range_iceberg_executor", account, connector, pair
+                )
+                for record in records:
+                    stored.append((record.executor_id, record.config, record.final_state))
+            for executor_id, config_raw, final_state in stored:
+                if self._range_iceberg_side_of_stored(config_raw, final_state) == side:
+                    occupant = executor_id
+                    break
+        if occupant is None:
+            return
+        account, _connector, pair, side = slot
+        detail = (
+            f"A range iceberg is already open on {pair} {side} for {account}. Close it first."
+        )
+        logger.info("%s Existing executor %s.", detail, occupant)
+        raise HTTPException(status_code=409, detail=detail)
+
     async def create_executor(
         self,
         executor_config: Dict[str, Any],
@@ -2787,6 +2889,10 @@ class ExecutorService:
 
         Returns:
             Dictionary with executor_id and initial status
+
+        Raises:
+            HTTPException: 409 when a range iceberg is already open on the same
+            account, connector, trading pair, and side
         """
         account = account_name or self.default_account
         trading_interface = self._get_trading_interface(account)
@@ -2813,10 +2919,33 @@ class ExecutorService:
             "created_at": datetime.now(timezone.utc),
             "config": executor_config
         }
-        executor_id, executor = self._instantiate_and_register(executor_class, typed_config, trading_interface, metadata)
+        slot = None
+        if executor_type == "range_iceberg_executor":
+            side_value = getattr(typed_config, "side", None)
+            if side_value in (None, ""):
+                side_value = executor_config.get("side")
+            slot = (
+                account,
+                connector_name or "",
+                trading_pair or "",
+                _range_iceberg_side_name(side_value),
+            )
 
-        # Persist to database
-        await self._persist_executor_created(executor_id, executor)
+        async def _register_and_persist():
+            created_id, created = self._instantiate_and_register(
+                executor_class, typed_config, trading_interface, metadata
+            )
+            await self._persist_executor_created(created_id, created)
+            return created_id, created
+
+        if slot is None:
+            executor_id, executor = await _register_and_persist()
+        else:
+            # The lock covers the open check and the register, so a second
+            # create on this slot waits until the first is in memory and stored.
+            async with self._range_iceberg_slot_lock(slot):
+                await self._assert_range_iceberg_slot_free(slot)
+                executor_id, executor = await _register_and_persist()
 
         # Capture created_at before potential cleanup
         created_at = metadata["created_at"].isoformat()
