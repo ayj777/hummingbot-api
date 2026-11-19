@@ -70,6 +70,7 @@ class V2WithControllers(StrategyV2Base):
             self.send_performance_report()
 
     def control_max_drawdown(self):
+        self._apply_aiot_drawdown()
         if self.config.max_controller_drawdown_quote:
             self.check_max_controller_drawdown()
         if self.config.max_global_drawdown_quote:
@@ -79,7 +80,10 @@ class V2WithControllers(StrategyV2Base):
         for controller_id, controller in self.controllers.items():
             if controller.status != RunnableStatus.RUNNING:
                 continue
-            controller_pnl = self.get_performance_report(controller_id).global_pnl_quote
+            report = self.get_performance_report(controller_id)
+            if report is None:
+                continue
+            controller_pnl = report.global_pnl_quote
             last_max_pnl = self.max_pnl_by_controller[controller_id]
             if controller_pnl > last_max_pnl:
                 self.max_pnl_by_controller[controller_id] = controller_pnl
@@ -87,6 +91,11 @@ class V2WithControllers(StrategyV2Base):
                 current_drawdown = last_max_pnl - controller_pnl
                 if current_drawdown > self.config.max_controller_drawdown_quote:
                     self.logger().info(f"Controller {controller_id} reached max drawdown. Stopping the controller.")
+                    close = getattr(controller, "protective_close_action", None)
+                    if callable(close):
+                        action = close()
+                        if action is not None:
+                            self.executor_orchestrator.execute_actions([action])
                     controller.stop()
                     executors_order_placed = self.filter_executors(
                         executors=self.get_executors_by_controller(controller_id),
@@ -218,19 +227,34 @@ class V2WithControllers(StrategyV2Base):
             return
         connector = None
         pair = "AIOT-USDT"
+        found = False
         for controller in self.controllers.values():
             dumped = controller.config.model_dump()
             if dumped.get("controller_name") != "aiot_research":
                 continue
+            found = True
             connector = self.connectors.get(dumped.get("connector_name"))
             pair = dumped.get("trading_pair") or pair
             break
+        if not found:
+            return
         quote = drawdown_quote_from_equity(_quote_balance(connector, pair))
         if quote is None:
-            self.logger().warning(
-                "AIOT left max_controller_drawdown_quote unset. "
-                "The quote balance could not be read."
-            )
+            loaded = connector is None or getattr(connector, "ready", False)
+            if not loaded:
+                return
+            if not getattr(self, "_aiot_balance_warned", False):
+                self._aiot_balance_warned = True
+                self.logger().warning(
+                    "AIOT entries stay off. The quote balance could not be read."
+                )
+            for controller in self.controllers.values():
+                dumped = controller.config.model_dump()
+                if dumped.get("controller_name") != "aiot_research":
+                    continue
+                refuse = getattr(controller, "refuse_entries", None)
+                if callable(refuse):
+                    refuse()
             return
         self.config.max_controller_drawdown_quote = float(quote)
 

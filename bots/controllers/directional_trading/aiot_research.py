@@ -13,11 +13,11 @@ price rather than the highest closed bar, and it cannot express a partial, a
 ladder, a stop measured from the first fill, or the re-arm rule.
 
 A buy uses PositionAction.OPEN. A sell uses PositionAction.CLOSE so hedge mode
-closes the long. size_mode max caps each entry at the configured ceiling and at
-the available balance times leverage times 0.95, then splits that base at the
-exchange max order size. After a fill, a reduce-only stop rests at the hard
-stop. The trail stays in the engine. The exchange stop is replaced when a
-partial changes the size and cancelled when the position is flat.
+closes the long. size_mode max caps the whole position at the configured
+ceiling, at the available balance times leverage times 0.95, and at 98 percent
+of one order. The exchange stop is that position, at the hard stop. The trail
+stays in the engine. A new stop is placed before the old one is cancelled, and
+the stop stays up until the live long is flat.
 """
 
 from __future__ import annotations
@@ -106,8 +106,14 @@ class AiotResearchController(DirectionalTradingControllerBase):
         self._applied_base = {}
         self._last_bar = None
         self._limit_live = set()
-        self._stops = {}
-        self._stop_inflight = set()
+        self._stop = {}
+        self._stop_inflight = False
+        self._stop_sync_inflight = False
+        self._stop_sync_next = 0.0
+        self._live_long = None
+        self._exit_reserved = Decimal("0")
+        self._drawdown_cap = None
+        self._entries_halted = False
         self._warned = set()
         self._leverage_ready = False
         self._leverage_inflight = False
@@ -152,6 +158,8 @@ class AiotResearchController(DirectionalTradingControllerBase):
         actions = []
         self._schedule_leverage()
         self._reconcile()
+        self._apply_live_position()
+        self._exit_reserved = Decimal("0")
         mid = self._mid_price()
         if mid is not None:
             for sleeve in self._sleeves:
@@ -292,7 +300,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
                     sleeve.apply_buy_fill(price, delta, notional, now, rung_reason, -1)
                 elif role == "sell":
                     sleeve.exit_reason = sleeve.exit_reason or "exit"
-                    sleeve.apply_sell_fill(price, now, -1)
+                    sleeve.apply_partial_sell(price, delta, now, -1)
                 elif role == "limit":
                     sleeve.apply_limit_fill(price, delta, now, -1)
             elif done and filled <= 0.0 and executor.id not in self._applied_base:
@@ -309,7 +317,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
 
     def _buys_still_live(self, sleeve_name: str, exclude: str) -> bool:
         prefix = f"aiot:{sleeve_name}:buy"
-        for executor in self.executors_info or []:
+        for executor in getattr(self, "executors_info", None) or []:
             if executor.id == exclude or not _is_active(executor):
                 continue
             level = getattr(executor.config, "level_id", None) or ""
@@ -325,11 +333,15 @@ class AiotResearchController(DirectionalTradingControllerBase):
 
     def _intent_actions(self, intent: Intent):
         if intent.kind == "market_sell":
-            if intent.base <= 0.0:
+            amount = self._clip_sell(intent.base)
+            if amount is None:
+                return [], True
+            if amount <= 0:
                 return [], False
+            self._exit_reserved = getattr(self, "_exit_reserved", Decimal("0")) + amount
             action = self._create(
                 TradeType.SELL,
-                intent.base,
+                float(amount),
                 None,
                 f"aiot:{intent.sleeve}:sell",
                 ExecutionStrategy.MARKET,
@@ -347,7 +359,10 @@ class AiotResearchController(DirectionalTradingControllerBase):
                 "AIOT held an entry until leverage 1 isolated is confirmed.",
             )
             return [], True
-        budget = self._entry_budget()
+        price = float(intent.price or 0.0)
+        if price <= 0.0:
+            return [], False
+        budget = self._entry_budget(price)
         if budget is None:
             self._warn_once(
                 "balance",
@@ -358,34 +373,31 @@ class AiotResearchController(DirectionalTradingControllerBase):
         if limits is None:
             self._warn_once("rules", "AIOT skipped an entry because trading rules are not loaded.")
             return [], True
-        min_size, max_size, step = limits
-        price = float(intent.price or 0.0)
-        if price <= 0.0:
-            return [], False
         base = scaled_base(intent.notional, self._spec.total_quote, budget, price)
-        chunks = split_base(base, min_size, max_size, step)
-        if not chunks:
+        amount = _one_order(base, limits)
+        if amount is None:
             self._warn_once("min", "AIOT skipped an entry below the minimum order size.")
             return [], False
         role = "buy" if intent.rung is None else f"buy:{intent.rung}"
-        actions = []
-        for index, chunk in enumerate(chunks):
-            level = f"aiot:{intent.sleeve}:{role}"
-            if len(chunks) > 1:
-                level = f"{level}:c{index}"
-            action = self._create(
-                TradeType.BUY, float(chunk), None, level, ExecutionStrategy.MARKET
-            )
-            if action is not None:
-                actions.append(action)
-        return actions, False
+        action = self._create(
+            TradeType.BUY,
+            float(amount),
+            None,
+            f"aiot:{intent.sleeve}:{role}",
+            ExecutionStrategy.MARKET,
+        )
+        return ([action] if action is not None else []), False
 
     def _limit_action(self, sleeve: Sleeve) -> Optional[CreateExecutorAction]:
         if sleeve.phase != "open" or sleeve.limit_price is None or sleeve.limit_base <= 0.0:
             return None
+        amount = self._clip_sell(sleeve.limit_base)
+        if amount is None or amount <= 0:
+            return None
+        self._exit_reserved = getattr(self, "_exit_reserved", Decimal("0")) + amount
         return self._create(
             TradeType.SELL,
-            sleeve.limit_base,
+            float(amount),
             sleeve.limit_price,
             f"aiot:{sleeve.spec.name}:limit",
             ExecutionStrategy.LIMIT,
@@ -433,12 +445,42 @@ class AiotResearchController(DirectionalTradingControllerBase):
         self.logger().warning(message)
 
     def _entries_allowed(self) -> bool:
+        if getattr(self, "_entries_halted", False):
+            return False
         connector = self._connector()
         if connector is None:
             return False
+        if callable(getattr(connector, "get_available_balance", None)):
+            if self._available_quote() is None:
+                self._warn_once(
+                    "balance",
+                    "AIOT entries stay off until the quote balance can be read.",
+                )
+                return False
         if not callable(getattr(connector, "confirm_leverage_and_margin", None)):
             return True
         return self._leverage_ready
+
+    def refuse_entries(self) -> None:
+        self._entries_halted = True
+
+    def _available_quote(self):
+        if getattr(self, "_drawdown_cap", None) is not None:
+            return self._drawdown_cap / Decimal("0.20")
+        connector = self._connector()
+        getter = getattr(connector, "get_available_balance", None)
+        if not callable(getter):
+            return None
+        quote = self.config.trading_pair.split("-")[-1]
+        try:
+            balance = getter(quote)
+            cash = Decimal(str(balance))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if cash <= 0:
+            return None
+        self._drawdown_cap = cash * Decimal("0.20")
+        return cash
 
     def _schedule_leverage(self) -> None:
         connector = self._connector()
@@ -471,22 +513,19 @@ class AiotResearchController(DirectionalTradingControllerBase):
         finally:
             self._leverage_inflight = False
 
-    def _entry_budget(self):
+    def _entry_budget(self, price):
+        limits = self._order_limits()
+        if limits is None:
+            return None
+        _low, high, _step = limits
+        order_quote = high * Decimal(str(price)) * Decimal("0.98")
         ceiling = Decimal(str(self.config.total_amount_quote))
         if self.config.size_mode == "fixed":
-            return ceiling
-        connector = self._connector()
-        if connector is None:
+            return min(ceiling, order_quote)
+        balance = self._available_quote()
+        if balance is None:
             return None
-        getter = getattr(connector, "get_available_balance", None)
-        if not callable(getter):
-            return None
-        quote = self.config.trading_pair.split("-")[-1]
-        try:
-            balance = getter(quote)
-        except Exception:
-            return None
-        return max_entry_quote(ceiling, balance, int(self.config.leverage))
+        return max_entry_quote(ceiling, balance, int(self.config.leverage), order_quote)
 
     def _order_limits(self):
         connector = self._connector()
@@ -503,66 +542,210 @@ class AiotResearchController(DirectionalTradingControllerBase):
             return None
         return low, high, getattr(rule, "min_base_amount_increment", None)
 
+    def _order_cap(self):
+        limits = self._order_limits()
+        if limits is None:
+            return None
+        _low, high, step = limits
+        return _quantize_down(high * Decimal("0.98"), step)
+
+    def _clip_sell(self, sleeve_base):
+        """None means the trading rules are not loaded yet, so the exit waits."""
+        if sleeve_base is None or sleeve_base <= 0:
+            return Decimal("0")
+        if self._connector() is not None and self._order_limits() is None:
+            rules = getattr(self._connector(), "trading_rules", None)
+            if isinstance(rules, dict):
+                return None
+        live = getattr(self, "_live_long", None)
+        reserved = getattr(self, "_exit_reserved", Decimal("0"))
+        if live is None:
+            room = Decimal(str(sleeve_base))
+        else:
+            room = live - reserved
+        if room < 0:
+            room = Decimal("0")
+        amount = min(Decimal(str(sleeve_base)), room)
+        cap = self._order_cap()
+        if cap is not None:
+            amount = min(amount, cap)
+        limits = self._order_limits()
+        step = limits[2] if limits is not None else None
+        amount = _quantize_down(amount, step)
+        if limits is not None and amount < limits[0]:
+            return Decimal("0")
+        return amount
+
+    def _apply_live_position(self) -> None:
+        connector = self._connector()
+        live = live_long_base(connector, self.config.trading_pair)
+        self._live_long = live
+        if live is None:
+            return
+        if live <= 0:
+            for sleeve in self._sleeves:
+                if sleeve.base > 0 or sleeve.phase != "flat":
+                    sleeve._flatten()
+            return
+        bases = [Decimal(str(sleeve.base)) for sleeve in self._sleeves]
+        pending = any(sleeve.phase == "pending_entry" for sleeve in self._sleeves)
+        if sum(bases, Decimal("0")) <= 0:
+            buying = any(
+                self._buys_still_live(sleeve.spec.name, "") for sleeve in self._sleeves
+            )
+            if pending or buying:
+                return
+            self._sleeves[0].base = float(live)
+            self._sleeves[0].phase = "open"
+            return
+        if sum(bases, Decimal("0")) <= live:
+            return
+        for sleeve, base in zip(self._sleeves, cap_bases(bases, live)):
+            sleeve.base = float(base)
+            if sleeve.base <= 1e-12:
+                sleeve._flatten()
+
+    def _hard_stop_price(self):
+        prices = [sleeve.stop_price for sleeve in self._sleeves if sleeve.stop_price]
+        if prices:
+            return max(prices)
+        saved = (self._stop or {}).get("price")
+        if saved in (None, ""):
+            return None
+        try:
+            return float(saved)
+        except (TypeError, ValueError):
+            return None
+
+    def _stop_amount(self):
+        live = self._live_long
+        if live is None:
+            live = sum((Decimal(str(sleeve.base)) for sleeve in self._sleeves), Decimal("0"))
+        amount = Decimal(str(live))
+        cap = self._order_cap()
+        if cap is not None:
+            amount = min(amount, cap)
+        return amount
+
+    def protective_close_action(self):
+        self._entries_halted = True
+        amount = self._stop_amount()
+        if amount is None or amount <= 0:
+            return None
+        return self._create(
+            TradeType.SELL,
+            float(amount),
+            None,
+            "aiot:drawdown:sell",
+            ExecutionStrategy.MARKET,
+        )
+
+    def _schedule_stop_list(self, connector) -> None:
+        if not callable(getattr(connector, "list_open_stop_orders", None)):
+            return
+        if self._stop_sync_inflight:
+            return
+        now = self._now()
+        if self._stop_sync_next and now < self._stop_sync_next:
+            return
+        self._stop_sync_inflight = True
+        self._stop_sync_next = now + 30.0
+        safe_ensure_future(self._sync_stops(connector))
+
+    async def _sync_stops(self, connector) -> None:
+        try:
+            rows = await connector.list_open_stop_orders(self.config.trading_pair)
+        except Exception as exc:
+            self.logger().warning(f"AIOT could not list stop orders: {exc}")
+            return
+        finally:
+            self._stop_sync_inflight = False
+        if self._stop_inflight:
+            return
+        ids = stop_order_ids(rows)
+        if ids is None:
+            return
+        current = (self._stop or {}).get("id")
+        if current and str(current) in ids:
+            return
+        if not ids:
+            if current and self._live_long is not None:
+                self._stop = {}
+            return
+        self._stop = {
+            "id": ids[0],
+            "amount": (self._stop or {}).get("amount"),
+            "price": (self._stop or {}).get("price"),
+        }
+
     def _schedule_stops(self) -> None:
         connector = self._connector()
         if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
             return
-        for sleeve in self._sleeves:
-            name = sleeve.spec.name
-            if name in self._stop_inflight:
-                continue
-            state = self._stops.get(name) or {}
-            plan = protective_stop_plan(
-                state.get("id"),
-                state.get("amount"),
-                state.get("price"),
-                sleeve.base,
-                sleeve.stop_price,
-            )
-            if plan == "hold":
-                continue
-            self._stop_inflight.add(name)
-            safe_ensure_future(
-                self._run_stop(connector, name, plan, sleeve.base, sleeve.stop_price)
-            )
+        self._schedule_stop_list(connector)
+        if self._stop_inflight:
+            return
+        live = self._live_long
+        price = self._hard_stop_price()
+        state = self._stop or {}
+        plan = protective_stop_plan(
+            state.get("id"),
+            state.get("amount"),
+            state.get("price"),
+            None if live is None else live,
+            price,
+            live_known=live is not None,
+        )
+        if plan == "hold":
+            return
+        amount = self._stop_amount()
+        if plan == "place" and (amount is None or amount <= 0 or not price):
+            return
+        self._stop_inflight = True
+        safe_ensure_future(self._run_stop(connector, plan, amount, price))
 
-    async def _run_stop(self, connector, name, plan, base, stop_price) -> None:
+    async def _run_stop(self, connector, plan, base, stop_price) -> None:
+        state = dict(self._stop or {})
+        stop_id = state.get("id")
         try:
-            state = self._stops.get(name) or {}
-            stop_id = state.get("id")
             if plan == "cancel":
                 await _cancel_stop(connector, stop_id)
-                self._stops.pop(name, None)
+                self._stop = {}
                 return
             position_id = long_position_id(connector, self.config.trading_pair)
             if position_id is None:
-                self._warn_once(
-                    f"stop-{name}",
-                    f"AIOT {name} has no long position id, so the stop was not placed.",
-                )
+                self._warn_once("stop", "AIOT has no long position id, so the stop was not placed.")
                 return
-            if stop_id:
-                await _cancel_stop(connector, stop_id)
-                self._stops.pop(name, None)
             new_id = await connector.place_position_stop_order(
                 self.config.trading_pair,
                 position_id,
                 _decimal(base),
                 stop_loss_price=_decimal(stop_price),
                 vol_type=1,
+                stop_loss_reverse=2,
             )
             if not new_id:
-                self.logger().error(f"AIOT {name} stop was not accepted.")
+                self.logger().error("AIOT stop was not accepted. The previous stop is unchanged.")
                 return
-            self._stops[name] = {
+            self._stop = {
                 "id": str(new_id),
                 "amount": str(_decimal(base)),
                 "price": str(_decimal(stop_price)),
             }
         except Exception as exc:
-            self.logger().error(f"AIOT {name} stop update failed: {exc}")
+            self.logger().error(f"AIOT stop update failed. The previous stop is unchanged: {exc}")
+            if state.get("id") and not (self._stop or {}).get("id"):
+                self._stop = state
+            return
         finally:
-            self._stop_inflight.discard(name)
+            self._stop_inflight = False
+        if stop_id and stop_id != str(new_id):
+            try:
+                await _cancel_stop(connector, stop_id)
+            except Exception as exc:
+                self.logger().error(
+                    f"AIOT placed stop {new_id} but could not cancel {stop_id}: {exc}"
+                )
 
     def _load_state(self) -> None:
         if not self._state_path.exists():
@@ -581,7 +764,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
                 sleeve.import_state(state)
         self._applied_base = {key: float(value) for key, value in (payload.get("applied_base") or {}).items()}
         self._last_bar = payload.get("last_bar")
-        self._stops = payload.get("stops") or {}
+        self._stop = _saved_stop(payload)
 
     def _save_state(self) -> None:
         payload = {
@@ -589,7 +772,7 @@ class AiotResearchController(DirectionalTradingControllerBase):
             "strategy": self._spec.key,
             "last_bar": self._last_bar,
             "applied_base": self._applied_base,
-            "stops": self._stops,
+            "stop": self._stop,
             "sleeves": [sleeve.export_state() for sleeve in self._sleeves],
         }
         try:
@@ -605,7 +788,7 @@ def position_action_for(side) -> PositionAction:
     return PositionAction.OPEN
 
 
-def max_entry_quote(ceiling, balance, leverage, buffer=Decimal("0.95")):
+def max_entry_quote(ceiling, balance, leverage, order_quote=None, buffer=Decimal("0.95")):
     if balance is None:
         return None
     try:
@@ -616,7 +799,13 @@ def max_entry_quote(ceiling, balance, leverage, buffer=Decimal("0.95")):
         return None
     if cash <= 0 or cap <= 0 or room <= 0:
         return None
-    return min(cap, room)
+    budget = min(cap, room)
+    if order_quote is not None:
+        try:
+            budget = min(budget, Decimal(str(order_quote)))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+    return budget if budget > 0 else None
 
 
 def scaled_base(notional, strategy_total, budget, price) -> Decimal:
@@ -630,34 +819,22 @@ def scaled_base(notional, strategy_total, budget, price) -> Decimal:
     return base
 
 
-def split_base(amount, min_size, max_size, step=None):
-    try:
-        left = Decimal(str(amount))
-        low = Decimal(str(min_size))
-        high = Decimal(str(max_size))
-        increment = None if step is None else Decimal(str(step))
-    except (ArithmeticError, TypeError, ValueError):
-        return []
-    if left <= 0 or low <= 0 or high <= 0 or high < low:
-        return []
-    chunks = []
-    while left >= low and len(chunks) < 50:
-        chunk = high if left > high else left
-        if increment is not None and increment > 0:
-            chunk = (chunk // increment) * increment
-        if chunk < low:
-            break
-        chunks.append(chunk)
-        left -= chunk
-    return chunks
+def protective_stop_plan(
+    stop_id, tracked_amount, tracked_price, base, stop_price, live_known=True
+) -> str:
+    """Exchange stop stays on the hard stop. The trail is not an argument.
 
-
-def protective_stop_plan(stop_id, tracked_amount, tracked_price, base, stop_price) -> str:
-    """Exchange stop stays on the hard stop. The trail is not an argument."""
+    An unknown live position holds. A known flat position cancels. A missing
+    hard-stop price holds, so a working stop is not removed.
+    """
+    if not live_known:
+        return "hold"
     amount = Decimal("0") if base is None else _decimal(float(base))
-    price = None if stop_price is None else _decimal(float(stop_price))
-    if amount <= 0 or price is None or price <= 0:
+    if amount <= 0:
         return "cancel" if stop_id else "hold"
+    price = None if stop_price is None else _decimal(float(stop_price))
+    if price is None or price <= 0:
+        return "hold"
     if stop_id and _same_text(tracked_amount, amount) and _same_text(tracked_price, price):
         return "hold"
     return "place"
@@ -706,6 +883,101 @@ async def _cancel_stop(connector, stop_id) -> None:
     if not stop_id:
         return
     await connector.cancel_stop_orders([stop_id])
+
+
+def _one_order(base, limits):
+    low, high, step = limits
+    amount = min(Decimal(str(base)), high * Decimal("0.98"))
+    amount = _quantize_down(amount, step)
+    if amount < low:
+        return None
+    return amount
+
+
+def _quantize_down(amount, step):
+    size = Decimal(str(amount))
+    if step is None:
+        return size
+    try:
+        increment = Decimal(str(step))
+    except (ArithmeticError, TypeError, ValueError):
+        return size
+    if increment <= 0:
+        return size
+    return (size // increment) * increment
+
+
+def cap_bases(bases, live):
+    total = sum(bases, Decimal("0"))
+    if live <= 0 or total <= 0:
+        return [Decimal("0") for _ in bases]
+    if total <= live:
+        return list(bases)
+    out = []
+    left = Decimal(str(live))
+    last = len(bases) - 1
+    for index, base in enumerate(bases):
+        if index == last:
+            out.append(left)
+            break
+        part = base * Decimal(str(live)) / total
+        if part > left:
+            part = left
+        out.append(part)
+        left -= part
+    return out
+
+
+def live_long_base(connector, trading_pair: str):
+    positions = getattr(connector, "account_positions", None)
+    if not isinstance(positions, dict):
+        return None
+    total = Decimal("0")
+    for position in positions.values():
+        if getattr(position, "trading_pair", None) != trading_pair:
+            continue
+        if getattr(position, "position_side", None) is PositionSide.SHORT:
+            continue
+        try:
+            amount = Decimal(str(getattr(position, "amount", 0)))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+        if amount > 0:
+            total += amount
+    if total > 0:
+        return total
+    if getattr(connector, "ready", False):
+        return Decimal("0")
+    return None
+
+
+def stop_order_ids(rows):
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("orders") or rows.get("result")
+    if not isinstance(rows, list):
+        return None
+    ids = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("id", "orderId", "stopPlanOrderId"):
+            value = row.get(key)
+            if value not in (None, ""):
+                ids.append(str(value))
+                break
+    return ids
+
+
+def _saved_stop(payload) -> dict:
+    stop = payload.get("stop")
+    if isinstance(stop, dict) and stop:
+        return stop
+    saved = payload.get("stops")
+    if isinstance(saved, dict):
+        for value in saved.values():
+            if isinstance(value, dict) and value.get("id"):
+                return value
+    return {}
 
 
 def _rung_index(parts) -> Optional[int]:

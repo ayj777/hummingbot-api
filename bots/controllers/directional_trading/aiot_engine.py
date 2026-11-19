@@ -547,6 +547,15 @@ class Sleeve:
             self.seen_regime_off = saw_off
         return Fill(self.spec.name, "sell", price, base, notional, reason, bar_index, time)
 
+    def apply_partial_sell(self, price: float, base: float, time: int, bar_index: int) -> Fill:
+        sold = min(base, self.base)
+        if sold >= self.base - 1e-12:
+            return self.apply_sell_fill(price, time, bar_index)
+        self.base -= sold
+        self.phase = "open"
+        self.exit_reason = None
+        return Fill(self.spec.name, "sell", price, sold, sold * price, "exit", bar_index, time)
+
     def apply_limit_fill(self, price: float, base: float, time: int, bar_index: int) -> Fill:
         return self._fill_limit_amount(price, base, time, bar_index)
 

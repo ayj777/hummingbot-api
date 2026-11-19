@@ -122,7 +122,7 @@ The stock position-executor barrier would not match these rules:
 - Its take-profit closes the whole position, so a 50% or 67% partial, a ladder, and a stop measured from the first fill cannot be expressed.
 - The re-arm rule is controller state.
 
-Entries, stop exits, cross exits, RSI exits, and time exits are market `OrderExecutor`s. Partials and the S2326 take-profit are resting limit sells. The engine is the only decision maker. `leverage` is 1 and `position_mode` is `HEDGE`. Buys use `PositionAction.OPEN`. Sells use `PositionAction.CLOSE`, so a hedge-mode sell closes the long. `size_mode` is `max`: each entry is capped at `total_amount_quote` and at the available quote times leverage times 0.95, and a size above the exchange max order is split. Relative sleeve weights stay the fractions of the strategy notional.
+Entries, stop exits, cross exits, RSI exits, and time exits are market `OrderExecutor`s. Partials and the S2326 take-profit are resting limit sells. The engine is the only decision maker. `leverage` is 1 and `position_mode` is `HEDGE`. Buys use `PositionAction.OPEN`. Sells use `PositionAction.CLOSE`, so a hedge-mode sell closes the long. `size_mode` is `max`: the whole position is capped at `total_amount_quote`, at the available quote times leverage times 0.95, and at 98 percent of one exchange order. Relative sleeve weights stay the fractions of that cap. The exchange stop covers that position until the live long is flat.
 
 ## Where the paper bot differs from the tests
 
