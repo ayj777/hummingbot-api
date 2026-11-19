@@ -74,6 +74,10 @@ def _controller(connector, strategy="f1", **overrides):
     controller._stop = {}
     controller._stop_inflight = False
     controller._live_long = None
+    controller._flat_streak = 0
+    controller._positions_seen = False
+    controller._fetch_inflight = False
+    controller._fetch_next = 0.0
     controller._exit_reserved = Decimal("0")
     controller._drawdown_cap = None
     controller._entries_halted = False
@@ -402,22 +406,36 @@ def test_two_sleeves_share_one_live_long():
     assert oversized[0].executor_config.amount == Decimal("61740.00000000")
 
 
-def test_a_flat_live_long_clears_a_phantom_sleeve():
+def test_a_ready_empty_position_map_is_unknown():
     connector = SimpleNamespace(account_positions={}, ready=True)
+
+    async def _update_positions():
+        return None
+
+    connector._update_positions = _update_positions
     controller = _controller(connector)
+    controller._fetch_inflight = True
     sleeve = Sleeve(STRATEGIES["f1"].sleeves[0])
     sleeve.base = 1000.0
     sleeve.phase = "open"
     sleeve.stop_price = 0.07
     controller._sleeves = [sleeve]
-    controller._stop = {"id": "dead", "amount": "1000", "price": "0.07000000"}
+    controller._stop = {"id": "live-stop", "amount": "1000", "price": "0.07000000"}
     controller._apply_live_position()
-    assert sleeve.phase == "flat"
-    assert sleeve.base == 0.0
-    assert controller._live_long == Decimal("0")
-    assert protective_stop_plan("dead", "1000", "0.07", Decimal("0"), 0.07) == "cancel"
-    unread = SimpleNamespace(account_positions={}, ready=False)
-    assert live_long_base(unread, "AIOT-USDT") is None
+    assert sleeve.phase == "open"
+    assert sleeve.base == 1000.0
+    assert sleeve.stop_price == 0.07
+    assert controller._live_long is None
+    assert controller._stop["id"] == "live-stop"
+    assert live_long_base(connector, "AIOT-USDT") is None
+    held = protective_stop_plan("live-stop", "1000", "0.07", None, 0.07, live_known=False)
+    assert held == "hold"
+    intent = Intent("core", "market_buy", 1.0, 15000.0, "entry", 1, None, float(PRICE))
+    connector.get_available_balance = lambda asset: Decimal("5925")
+    connector.trading_rules = {"AIOT-USDT": _Rule()}
+    actions, keep = controller._buy_actions(intent)
+    assert actions == []
+    assert keep is True
 
 
 def test_an_open_live_long_is_adopted_when_the_sleeve_is_flat():
@@ -425,6 +443,7 @@ def test_an_open_live_long_is_adopted_when_the_sleeve_is_flat():
         trading_pair="AIOT-USDT",
         position_side=PositionSide.LONG,
         amount=Decimal("1000"),
+        entry_price=Decimal("0.10"),
     )
     connector = SimpleNamespace(account_positions={"k": position}, ready=True)
     controller = _controller(connector)
@@ -433,6 +452,8 @@ def test_an_open_live_long_is_adopted_when_the_sleeve_is_flat():
     controller._apply_live_position()
     assert sleeve.phase == "open"
     assert sleeve.base == 1000.0
+    assert abs(sleeve.stop_price - 0.085) < 1e-9
+    assert protective_stop_plan(None, None, None, Decimal("1000"), sleeve.stop_price) == "place"
     rsi = Decimal("48000")
     trend = Decimal("20000")
     capped = cap_bases([rsi, trend], Decimal("50000"))
@@ -547,3 +568,64 @@ async def test_startup_adopts_a_live_stop_and_drops_a_dead_one():
     controller._live_long = Decimal("100")
     await controller._sync_stops(Empty())
     assert controller._stop == {}
+
+
+def _open_sleeve(controller):
+    sleeve = Sleeve(STRATEGIES["f1"].sleeves[0])
+    sleeve.base = 1000.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07
+    controller._sleeves = [sleeve]
+    controller._stop = {"id": "live-stop", "amount": "1000", "price": "0.07000000"}
+    return sleeve
+
+
+@pytest.mark.asyncio
+async def test_one_empty_fetch_does_not_cancel_the_stop():
+    connector = SimpleNamespace(account_positions={}, ready=True)
+
+    async def _update_positions():
+        return None
+
+    connector._update_positions = _update_positions
+    controller = _controller(connector)
+    sleeve = _open_sleeve(controller)
+    await controller._fetch_positions(connector)
+    controller._fetch_next = 10**12
+    controller._apply_live_position()
+    assert controller._flat_streak == 1
+    assert controller._live_long is None
+    assert sleeve.phase == "open"
+    assert sleeve.stop_price == 0.07
+    assert controller._stop["id"] == "live-stop"
+    await controller._fetch_positions(connector)
+    controller._apply_live_position()
+    assert controller._flat_streak == 2
+    assert controller._live_long == Decimal("0")
+    assert sleeve.phase == "flat"
+    assert protective_stop_plan("live-stop", "1000", "0.07", Decimal("0"), 0.07) == "cancel"
+
+
+def test_entries_use_a_fresh_balance():
+    seen = {"n": 0}
+
+    def balance(asset):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return Decimal("5925")
+        return Decimal("400")
+
+    connector = SimpleNamespace(
+        get_available_balance=balance,
+        trading_rules={"AIOT-USDT": _Rule()},
+    )
+    controller = _controller(connector)
+    first = controller._available_quote()
+    second = controller._available_quote()
+    assert first == Decimal("5925")
+    assert second == Decimal("400")
+    intent = Intent("core", "market_buy", 1.0, 15000.0, "entry", 1, None, float(PRICE))
+    actions, keep = controller._buy_actions(intent)
+    assert keep is False
+    quote = actions[0].executor_config.amount * PRICE
+    assert quote < Decimal("500")

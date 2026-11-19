@@ -17,7 +17,7 @@ closes the long. size_mode max caps the whole position at the configured
 ceiling, at the available balance times leverage times 0.95, and at 98 percent
 of one order. The exchange stop is that position, at the hard stop. The trail
 stays in the engine. A new stop is placed before the old one is cancelled, and
-the stop stays up until the live long is flat.
+the stop stays up until two position reads in a row show the long is flat.
 """
 
 from __future__ import annotations
@@ -111,6 +111,10 @@ class AiotResearchController(DirectionalTradingControllerBase):
         self._stop_sync_inflight = False
         self._stop_sync_next = 0.0
         self._live_long = None
+        self._flat_streak = 0
+        self._positions_seen = False
+        self._fetch_inflight = False
+        self._fetch_next = 0.0
         self._exit_reserved = Decimal("0")
         self._drawdown_cap = None
         self._entries_halted = False
@@ -354,10 +358,11 @@ class AiotResearchController(DirectionalTradingControllerBase):
     def _buy_actions(self, intent: Intent):
         if not self._entries_allowed():
             self._schedule_leverage()
-            self._warn_once(
-                "leverage",
-                "AIOT held an entry until leverage 1 isolated is confirmed.",
-            )
+            if not self._position_blocks_entries():
+                self._warn_once(
+                    "leverage",
+                    "AIOT held an entry until leverage 1 isolated is confirmed.",
+                )
             return [], True
         price = float(intent.price or 0.0)
         if price <= 0.0:
@@ -447,6 +452,12 @@ class AiotResearchController(DirectionalTradingControllerBase):
     def _entries_allowed(self) -> bool:
         if getattr(self, "_entries_halted", False):
             return False
+        if self._position_blocks_entries():
+            self._warn_once(
+                "position",
+                "AIOT entries stay off until a position snapshot is in.",
+            )
+            return False
         connector = self._connector()
         if connector is None:
             return False
@@ -465,8 +476,6 @@ class AiotResearchController(DirectionalTradingControllerBase):
         self._entries_halted = True
 
     def _available_quote(self):
-        if getattr(self, "_drawdown_cap", None) is not None:
-            return self._drawdown_cap / Decimal("0.20")
         connector = self._connector()
         getter = getattr(connector, "get_available_balance", None)
         if not callable(getter):
@@ -479,8 +488,15 @@ class AiotResearchController(DirectionalTradingControllerBase):
             return None
         if cash <= 0:
             return None
-        self._drawdown_cap = cash * Decimal("0.20")
+        if getattr(self, "_drawdown_cap", None) is None:
+            self._drawdown_cap = cash * Decimal("0.20")
         return cash
+
+    def _position_blocks_entries(self) -> bool:
+        connector = self._connector()
+        if not callable(getattr(connector, "_update_positions", None)):
+            return False
+        return getattr(self, "_live_long", None) is None
 
     def _schedule_leverage(self) -> None:
         connector = self._connector()
@@ -578,15 +594,27 @@ class AiotResearchController(DirectionalTradingControllerBase):
 
     def _apply_live_position(self) -> None:
         connector = self._connector()
-        live = live_long_base(connector, self.config.trading_pair)
-        self._live_long = live
-        if live is None:
+        self._schedule_position_fetch(connector)
+        mapped = None
+        if connector is not None:
+            mapped = live_long_base(connector, self.config.trading_pair)
+        if mapped is not None and mapped > 0:
+            self._positions_seen = True
+            self._flat_streak = 0
+            self._live_long = mapped
+            self._sync_sleeves_to_long(mapped, connector)
             return
-        if live <= 0:
-            for sleeve in self._sleeves:
-                if sleeve.base > 0 or sleeve.phase != "flat":
-                    sleeve._flatten()
+        seen = getattr(self, "_positions_seen", False)
+        streak = getattr(self, "_flat_streak", 0)
+        if not seen or streak < 2:
+            self._live_long = None
             return
+        self._live_long = Decimal("0")
+        for sleeve in self._sleeves:
+            if sleeve.base > 0 or sleeve.phase != "flat":
+                sleeve._flatten()
+
+    def _sync_sleeves_to_long(self, live, connector) -> None:
         bases = [Decimal(str(sleeve.base)) for sleeve in self._sleeves]
         pending = any(sleeve.phase == "pending_entry" for sleeve in self._sleeves)
         if sum(bases, Decimal("0")) <= 0:
@@ -595,8 +623,10 @@ class AiotResearchController(DirectionalTradingControllerBase):
             )
             if pending or buying:
                 return
-            self._sleeves[0].base = float(live)
-            self._sleeves[0].phase = "open"
+            sleeve = self._sleeves[0]
+            sleeve.base = float(live)
+            sleeve.phase = "open"
+            self._arm_adopted_stop(sleeve, connector)
             return
         if sum(bases, Decimal("0")) <= live:
             return
@@ -604,6 +634,51 @@ class AiotResearchController(DirectionalTradingControllerBase):
             sleeve.base = float(base)
             if sleeve.base <= 1e-12:
                 sleeve._flatten()
+
+    def _arm_adopted_stop(self, sleeve, connector) -> None:
+        if sleeve.stop_price:
+            return
+        entry = long_entry_price(connector, self.config.trading_pair)
+        if entry is None:
+            entry = self._mid_price()
+        saved = (self._stop or {}).get("price")
+        stop = hard_stop_for_entry(sleeve.spec, entry, saved)
+        if stop is None:
+            return
+        sleeve.stop_price = stop
+        if sleeve.first_fill_price is None and entry is not None:
+            sleeve.first_fill_price = float(entry)
+
+    def _schedule_position_fetch(self, connector) -> None:
+        if connector is None or not callable(getattr(connector, "_update_positions", None)):
+            return
+        if getattr(self, "_fetch_inflight", False):
+            return
+        now = self._now()
+        nxt = getattr(self, "_fetch_next", 0.0)
+        if nxt and now < nxt:
+            return
+        self._fetch_inflight = True
+        wait = 0.0 if getattr(self, "_live_long", None) is None else 30.0
+        self._fetch_next = now + wait
+        safe_ensure_future(self._fetch_positions(connector))
+
+    async def _fetch_positions(self, connector) -> None:
+        try:
+            result = connector._update_positions()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception as exc:
+            self.logger().warning(f"AIOT position fetch failed: {exc}")
+            return
+        finally:
+            self._fetch_inflight = False
+        mapped = live_long_base(connector, self.config.trading_pair)
+        self._positions_seen = True
+        if mapped is not None and mapped > 0:
+            self._flat_streak = 0
+            return
+        self._flat_streak = getattr(self, "_flat_streak", 0) + 1
 
     def _hard_stop_price(self):
         prices = [sleeve.stop_price for sleeve in self._sleeves if sleeve.stop_price]
@@ -946,9 +1021,44 @@ def live_long_base(connector, trading_pair: str):
             total += amount
     if total > 0:
         return total
-    if getattr(connector, "ready", False):
-        return Decimal("0")
     return None
+
+
+def long_entry_price(connector, trading_pair: str):
+    positions = getattr(connector, "account_positions", None)
+    if not isinstance(positions, dict):
+        return None
+    for position in positions.values():
+        if getattr(position, "trading_pair", None) != trading_pair:
+            continue
+        if getattr(position, "position_side", None) is PositionSide.SHORT:
+            continue
+        try:
+            price = Decimal(str(getattr(position, "entry_price", 0)))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def hard_stop_for_entry(spec, entry, saved=None):
+    if entry is not None and getattr(spec, "stop_pct", None):
+        try:
+            price = float(entry)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            return price * (1.0 - float(spec.stop_pct))
+    if saved in (None, ""):
+        return None
+    try:
+        price = float(saved)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return price
 
 
 def stop_order_ids(rows):
