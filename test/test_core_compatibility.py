@@ -1,10 +1,10 @@
 """A core older than this API must stop the boot, not quietly zero the books.
 
-``environment.yml`` installs hummingbot unpinned because the fields this API reads are
-not in a release yet, so a machine can very reasonably end up with an older core. The
+``environment.yml`` pins hummingbot to a git commit because the fields this API reads
+are not in a PyPI release yet, so an image can still be built from an older core. The
 read path in ``_persist_executor_completed`` wraps every figure in one broad
-``except Exception`` that logs at DEBUG and substitutes ``Decimal("0")`` — so on an old
-core the API does not fail, it books every executor's pnl, fees, filled amount and
+``except Exception`` that logs at DEBUG and substitutes ``Decimal("0")``. On an old
+core the API does not fail. It books every executor's pnl, fees, filled amount and
 volume as zero and never says why. That is the failure these tests exist to prevent.
 """
 from types import SimpleNamespace
@@ -21,16 +21,15 @@ def test_the_installed_core_carries_everything_this_api_reads():
     require_core_surface()
 
 
-def test_the_list_is_empty_because_nothing_extra_is_required_right_now():
-    """The guard stays; its contents do not.
-
-    It exists for a core field this API reads that a released hummingbot may not carry
-    yet. volume_traded_quote was the last such field and is gone — filled_amount_quote
-    means the volume traded on every executor type, LP included — so there is nothing
-    to require. An empty list is the honest state, and require_core_surface() passing
-    trivially is the point: no patched core needed to boot.
-    """
-    assert list(REQUIRED_CORE_SURFACE) == []
+def test_an_external_close_requires_the_new_close_type():
+    """Stored executor rows use close type 11. An older enum cannot parse them."""
+    assert REQUIRED_CORE_SURFACE == [
+        (
+            "hummingbot.strategy_v2.models.executors:CloseType",
+            "POSITION_CLOSED_EXTERNALLY",
+            "an external full close, stored as close type 11",
+        ),
+    ]
 
 
 def test_a_missing_field_is_a_startup_error_naming_it(monkeypatch):

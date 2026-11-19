@@ -148,3 +148,48 @@ class TestTheRoutesAnswerTheZeroFillArchive:
 
         assert performance["performance_data"] == []
         assert performance["error"] == "No trades found in database"
+
+
+def test_stored_executor_close_type_11_parses(zero_fill_db):
+    """Hummingbot stores CloseType as an int. 11 is POSITION_CLOSED_EXTERNALLY."""
+    import json
+    import sqlite3
+
+    from hummingbot.strategy_v2.models.executors import CloseType
+
+    from utils.hummingbot_database_reader import PerformanceDataSource
+
+    custom = {
+        "open_base": "5",
+        "exchange_position_base": "0",
+        "external_close": True,
+        "reconcile_error": "",
+    }
+    config = {"side": 1, "trading_pair": "BTC-USDT", "connector_name": "mexc_perpetual"}
+    connection = sqlite3.connect(zero_fill_db)
+    connection.execute(
+        "INSERT INTO Executors ("
+        "id, timestamp, type, close_timestamp, close_type, status, config, "
+        "net_pnl_pct, net_pnl_quote, cum_fees_quote, filled_amount_quote, "
+        "is_active, is_trading, custom_info, controller_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "ex-ext", 1700000000, "range_iceberg_executor", 1700000100, 11, 4,
+            json.dumps(config), 0.0, 0.0, 0.0, 0.0, 0, 0, json.dumps(custom), "main",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    raw = HummingbotDatabase(zero_fill_db).get_executors_data()
+    raw["config"] = raw["config"].apply(lambda value: json.loads(value) if isinstance(value, str) else value)
+    parsed = PerformanceDataSource({}).apply_special_data_types(raw)
+    row = parsed.iloc[0]
+    assert row["close_type"] == CloseType.POSITION_CLOSED_EXTERNALLY
+    assert row["close_type"].value == 11
+    assert row["close_type_name"] == "POSITION_CLOSED_EXTERNALLY"
+    stored = json.loads(row["custom_info"])
+    assert stored["exchange_position_base"] == "0"
+    assert stored["external_close"] is True
+    assert stored["reconcile_error"] == ""
+    assert stored["open_base"] == "5"
