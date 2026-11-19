@@ -22,12 +22,22 @@ def test_the_installed_core_carries_everything_this_api_reads():
 
 
 def test_an_external_close_requires_the_new_close_type():
-    """Stored executor rows use close type 11. An older enum cannot parse them."""
+    """Stored executor rows use close type 11. Shared tiers need the hint fields."""
     assert REQUIRED_CORE_SURFACE == [
         (
             "hummingbot.strategy_v2.models.executors:CloseType",
             "POSITION_CLOSED_EXTERNALLY",
             "an external full close, stored as close type 11",
+        ),
+        (
+            "hummingbot.strategy_v2.executors.range_iceberg_executor.data_types:RangeIcebergExecutorConfig",
+            "group_id",
+            "optional label on a range iceberg that shares a side",
+        ),
+        (
+            "hummingbot.strategy_v2.executors.range_iceberg_executor.data_types:RangeIcebergExecutorConfig",
+            "sibling_base",
+            "live size a tier must leave for the other tiers on its side",
         ),
     ]
 

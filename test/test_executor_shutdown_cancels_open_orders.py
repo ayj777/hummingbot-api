@@ -37,7 +37,10 @@ from services.executor_service import (
     _exchange_stop_ids,
     _exit_only_custom_info,
     child_order_ids_from_custom_info,
+    range_iceberg_entry_pauses,
     range_iceberg_held_base,
+    range_iceberg_side_held_base,
+    range_iceberg_sibling_hints,
 )
 
 
@@ -212,6 +215,8 @@ def _service(db=None, connectors=None):
     service._is_running = True
     service._log_capture = MagicMock()
     service._positions_held = {}
+    service._entry_pause_sent = {}
+    service._entry_pause_streak = {}
     service._lp_position_addresses = {}
     service._lp_rent_recorded = set()
     service._lp_rent_retry_after = {}
@@ -1192,6 +1197,10 @@ def test_search_record_keeps_range_iceberg_custom_info_fields():
         "exchange_position_base": "0",
         "external_close": True,
         "reconcile_error": "position read failed: timeout",
+        "group_id": "aiot-long",
+        "sibling_base": None,
+        "entry_paused": False,
+        "pause_reason": None,
     }
     record = SimpleNamespace(
         executor_id="ex-1",
@@ -2026,6 +2035,9 @@ class _OpenExecutor:
         self.applied = {}
         self.reject_edit = None
         self.edit_calls = 0
+        self.reported = {}
+        self.sibling_calls = []
+        self.entry_calls = []
 
     def start(self):
         return None
@@ -2054,10 +2066,24 @@ class _OpenExecutor:
                 "exchange_stop_order_id": "stop-kept",
             }
 
+    def set_sibling_base(self, amount):
+        self.sibling_calls.append(amount)
+        if amount is None:
+            self.reported["sibling_base"] = None
+        else:
+            self.reported["sibling_base"] = format(Decimal(str(amount)), "f")
+
+    def set_entry_paused(self, paused, reason):
+        self.entry_calls.append((bool(paused), reason))
+        self.reported["entry_paused"] = bool(paused)
+        self.reported["pause_reason"] = reason
+
     def get_custom_info(self):
         if self._kept is not None:
             return dict(self._kept)
-        return {"side": getattr(self.config, "side", "BUY")}
+        info = {"side": getattr(self.config, "side", "BUY")}
+        info.update(self.reported)
+        return info
 
 
 def _open_service(db):
@@ -2076,18 +2102,29 @@ def _open_service(db):
     return service
 
 
-def _open_config(side, pair="BTC-USDT", connector="mexc_perpetual"):
-    return {
+def _open_config(side, pair="BTC-USDT", connector="mexc_perpetual", **extra):
+    config = {
         "type": "range_iceberg_executor",
         "connector_name": connector,
         "trading_pair": pair,
         "side": side,
         "total_amount": "1",
     }
+    config.update(extra)
+    return config
+
+
+def _cap_detail():
+    return "10 range icebergs are already open on BTC-USDT BUY for master. Close one first."
+
+
+async def _open_ids(service, side="BUY"):
+    rows = await service._range_iceberg_open_rows(("master", "mexc_perpetual", "BTC-USDT", side))
+    return {row["executor_id"] for row in rows}
 
 
 @pytest.mark.asyncio
-async def test_second_long_is_rejected_including_a_parked_executor(db):
+async def test_a_parked_executor_counts_toward_the_cap(db):
     await _seed_iceberg_row(
         db,
         "parked-long",
@@ -2101,13 +2138,13 @@ async def test_second_long_is_rejected_including_a_parked_executor(db):
     )
     service = _open_service(db)
     assert "parked-long" not in service._active_executors
+    assert "parked-long" in await _open_ids(service)
+    for _ in range(9):
+        await service.create_executor(_open_config("BUY"), account_name="master")
     with pytest.raises(HTTPException) as caught:
         await service.create_executor(_open_config("BUY"), account_name="master")
     assert caught.value.status_code == 409
-    assert caught.value.detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master "
-        "(executor parked-long). Close it first."
-    )
+    assert caught.value.detail == _cap_detail()
 
 
 @pytest.mark.asyncio
@@ -2297,10 +2334,10 @@ async def test_a_stale_reconcile_error_does_not_free_the_slot(db):
         },
     )
     service = _open_service(db)
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert caught.value.status_code == 409
-    assert "stale-read" in caught.value.detail
+    assert "stale-read" in await _open_ids(service)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "stale-read"
+    assert "stale-read" in await _open_ids(service)
 
 
 @pytest.mark.asyncio
@@ -2313,7 +2350,7 @@ async def test_range_iceberg_on_another_account_is_allowed(db):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_range_iceberg_creates_only_one_succeeds(db):
+async def test_concurrent_range_iceberg_creates_both_succeed(db):
     service = _open_service(db)
     results = await asyncio.gather(
         service.create_executor(_open_config("BUY"), account_name="master"),
@@ -2322,15 +2359,11 @@ async def test_concurrent_range_iceberg_creates_only_one_succeeds(db):
     )
     created = [row for row in results if isinstance(row, dict)]
     rejected = [row for row in results if isinstance(row, HTTPException)]
-    assert len(created) == 1
-    assert len(rejected) == 1
-    assert rejected[0].status_code == 409
-    assert rejected[0].detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master "
-        f"(executor {created[0]['executor_id']}). Close it first."
-    )
+    assert len(created) == 2
+    assert rejected == []
+    assert created[0]["executor_id"] != created[1]["executor_id"]
     rows = [row for row in db.query(ExecutorRecord) if row.trading_pair == "BTC-USDT" and row.status == "RUNNING"]
-    assert len(rows) == 1
+    assert len(rows) == 2
 
 
 def _position_connector(amount, stop_ids=None):
@@ -2373,13 +2406,10 @@ async def _park_kept_position(service, db):
 async def test_keep_position_still_holds_the_slot(db):
     service = _open_service(db)
     parked = await _park_kept_position(service, db)
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert caught.value.status_code == 409
-    assert caught.value.detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master "
-        f"(executor {parked}). Close it first."
-    )
+    assert parked in await _open_ids(service)
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != parked
+    assert parked in await _open_ids(service)
 
 
 @pytest.mark.asyncio
@@ -2404,9 +2434,7 @@ async def test_release_slot_lets_a_new_range_iceberg_start(db):
     assert missing.value.status_code == 404
 
     parked = await _park_kept_position(service, db)
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert parked in caught.value.detail
+    assert parked in await _open_ids(service)
 
     released = await release_range_iceberg_slot(
         ReleaseRangeIcebergSlotRequest(
@@ -2429,6 +2457,7 @@ async def test_release_slot_lets_a_new_range_iceberg_start(db):
         "A new same-side executor runs on the software stop loss only. "
         "Its exchange stop is refused until the parked stop is gone."
     )
+    assert parked not in await _open_ids(service)
     stored = [row for row in db.query(ExecutorRecord) if row.executor_id == parked]
     assert json.loads(stored[0].final_state)["slot_released"] is True
 
@@ -2463,13 +2492,10 @@ async def test_stale_running_blocks_when_the_position_or_stop_is_live(db):
     await _seed_iceberg_row(db, "stale-open", {"side": "BUY", "open_base": "1"})
     service = _open_service(db)
     _use_book(service, _position_connector("1"))
-    with pytest.raises(HTTPException) as open_position:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert open_position.value.status_code == 409
-    assert open_position.value.detail == (
-        "A range iceberg is already open on BTC-USDT BUY for master "
-        "(executor stale-open). Close it first."
-    )
+    assert "stale-open" in await _open_ids(service)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "stale-open"
+    assert "stale-open" in await _open_ids(service)
 
     await _seed_iceberg_row(
         db,
@@ -2486,20 +2512,20 @@ async def test_stale_running_blocks_when_the_position_or_stop_is_live(db):
     short_book.account_positions["p"]["position_side"] = "SHORT"
     short_book.account_positions["p"]["amount"] = "0"
     _use_book(service, short_book)
-    with pytest.raises(HTTPException) as live_stop:
-        await service.create_executor(_open_config("SELL"), account_name="master")
-    assert live_stop.value.status_code == 409
-    assert "executor stale-stop" in live_stop.value.detail
+    assert "stale-stop" in await _open_ids(service, "SELL")
+    created = await service.create_executor(_open_config("SELL"), account_name="master")
+    assert created["executor_id"] != "stale-stop"
+    assert "stale-stop" in await _open_ids(service, "SELL")
 
 
 @pytest.mark.asyncio
 async def test_stale_running_blocks_when_the_book_cannot_be_read(db):
     await _seed_iceberg_row(db, "stale-unread", {"side": "BUY", "open_base": "0"})
     service = _open_service(db)
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert caught.value.status_code == 409
-    assert "executor stale-unread" in caught.value.detail
+    assert "stale-unread" in await _open_ids(service)
+    created = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert created["executor_id"] != "stale-unread"
+    assert "stale-unread" in await _open_ids(service)
 
 
 @pytest.mark.asyncio
@@ -2518,19 +2544,25 @@ async def test_position_hold_without_base_or_stop_does_not_hold_the_slot(db):
 async def test_trading_pair_case_and_separators_share_one_slot(db):
     service = _open_service(db)
     first = await service.create_executor(_open_config("BUY", pair="BTC-USDT"), account_name="master")
-    for pair in ("btc-usdt", "btc_usdt", "btc/usdt"):
-        with pytest.raises(HTTPException) as caught:
-            await service.create_executor(_open_config("BUY", pair=pair), account_name="master")
-        assert caught.value.status_code == 409
-        assert caught.value.detail == (
-            "A range iceberg is already open on BTC-USDT BUY for master "
-            f"(executor {first['executor_id']}). Close it first."
-        )
+    second = await service.create_executor(_open_config("BUY", pair="btc-usdt"), account_name="master")
+    ids = await _open_ids(service)
+    assert first["executor_id"] in ids
+    assert second["executor_id"] in ids
+    extra = 0
+    rejected = None
+    for _ in range(12):
+        try:
+            await service.create_executor(_open_config("BUY", pair="btc/usdt"), account_name="master")
+            extra += 1
+        except HTTPException as exc:
+            rejected = exc
+            break
+    assert extra == 8
+    assert rejected is not None
+    assert rejected.status_code == 409
+    assert rejected.detail == _cap_detail()
     service._active_executors.pop(first["executor_id"], None)
-    with pytest.raises(HTTPException) as stored:
-        await service.create_executor(_open_config("BUY", pair="btc_usdt"), account_name="master")
-    assert stored.value.status_code == 409
-    assert first["executor_id"] in stored.value.detail
+    assert first["executor_id"] in await _open_ids(service)
 
 
 class _FailingSession:
@@ -2700,10 +2732,10 @@ async def test_unreadable_target_position_is_not_flat(db):
         "entry_price": "1",
     }
     _use_book(service, connector)
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert caught.value.status_code == 409
-    assert "executor hold-bad" in caught.value.detail
+    assert "hold-bad" in await _open_ids(service)
+    allowed = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert allowed["executor_id"] != "hold-bad"
+    assert "hold-bad" in await _open_ids(service)
 
     connector.account_positions["p"]["amount"] = "0"
     created = await service.create_executor(_open_config("BUY"), account_name="master")
@@ -2873,10 +2905,9 @@ async def test_editing_a_range_iceberg_does_not_free_its_slot(db):
         executor_id,
         {"total_amount": "2", "price_low": "10", "price_high": "20"},
     )
-    with pytest.raises(HTTPException) as caught:
-        await service.create_executor(_open_config("BUY"), account_name="master")
-    assert caught.value.status_code == 409
-    assert executor_id in caught.value.detail
+    second = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert second["executor_id"] != executor_id
+    assert executor_id in await _open_ids(service)
     other = await service.create_executor(_open_config("SELL"), account_name="master")
     assert other["executor_id"] != executor_id
     assert executor_id in service._active_executors
@@ -3308,3 +3339,345 @@ async def test_u4_edit_after_resume_is_not_converted_again(db):
     assert connector.stop_cancels == []
     shown = service._format_db_record(row)
     assert shown["size_unit"] == "BASE"
+
+
+def test_sibling_hints_shrink_only_when_the_live_book_is_short():
+    """LIFO: the newest tier gives up size first. A sibling fill does not."""
+    oldest = {
+        "executor_id": "old",
+        "created_at": 1,
+        "open_base": Decimal("5"),
+        "exchange_position_base": Decimal("7"),
+    }
+    mid = {
+        "executor_id": "mid",
+        "created_at": 2,
+        "open_base": Decimal("3"),
+        "exchange_position_base": Decimal("7"),
+    }
+    newest = {
+        "executor_id": "new",
+        "created_at": 3,
+        "open_base": Decimal("2"),
+        "exchange_position_base": Decimal("7"),
+    }
+    hints = range_iceberg_sibling_hints([newest, oldest, mid])
+    assert hints == {
+        "old": Decimal("2"),
+        "mid": Decimal("5"),
+        "new": Decimal("7"),
+    }
+    newest["open_base"] = Decimal("0")
+    for row in (oldest, mid, newest):
+        row["exchange_position_base"] = Decimal("8")
+    after_fill = range_iceberg_sibling_hints([oldest, mid, newest])
+    assert after_fill["old"] == Decimal("3")
+    assert after_fill["mid"] == Decimal("5")
+    assert after_fill["new"] == Decimal("8")
+    assert range_iceberg_sibling_hints([oldest]) == {"old": None}
+    flat = dict(oldest)
+    flat["exchange_position_base"] = Decimal("0")
+    other = dict(mid)
+    other["exchange_position_base"] = Decimal("0")
+    assert range_iceberg_sibling_hints([flat, other]) == {}
+
+
+def test_side_held_base_counts_the_shared_book_once():
+    assert range_iceberg_side_held_base([
+        {"open_base": "4", "exchange_position_base": "10"},
+        {"open_base": "6", "exchange_position_base": "10"},
+    ]) == Decimal("10")
+    assert range_iceberg_side_held_base([
+        {"open_base": "5", "exchange_position_base": "7"},
+        {"open_base": "5", "exchange_position_base": "7"},
+    ]) == Decimal("7")
+    assert range_iceberg_held_base(
+        None, {"open_base": "5", "exchange_position_base": "0.4"},
+    ) == Decimal("0.4")
+
+
+def _limit_tier(executor_id, limit, unspent=True):
+    return {
+        "executor_id": executor_id,
+        "mode": "UP_TO",
+        "limit_price": Decimal(limit),
+        "unspent": unspent,
+    }
+
+
+def test_entry_pause_keeps_only_the_deepest_tier_the_price_qualifies_for():
+    tiers = [_limit_tier("t1", "0.1"), _limit_tier("t2", "0.09"), _limit_tier("t3", "0.08")]
+    assert range_iceberg_entry_pauses(tiers, "BUY", Decimal("0.095")) == {
+        "t1": None, "t2": None, "t3": None,
+    }
+    at_second = range_iceberg_entry_pauses(tiers, "BUY", Decimal("0.089"))
+    assert at_second == {
+        "t1": "deeper tier t2 active",
+        "t2": None,
+        "t3": None,
+    }
+    at_third = range_iceberg_entry_pauses(tiers, "BUY", Decimal("0.079"))
+    assert at_third["t1"] == "deeper tier t2 active"
+    assert at_third["t2"] == "deeper tier t3 active"
+    assert at_third["t3"] is None
+    assert range_iceberg_entry_pauses(tiers, "BUY", Decimal("0.095"))["t1"] is None
+    spent = [_limit_tier("t1", "0.1"), _limit_tier("t2", "0.09", False), _limit_tier("t3", "0.08")]
+    assert range_iceberg_entry_pauses(spent, "BUY", Decimal("0.089")) == {
+        "t1": None, "t2": None, "t3": None,
+    }
+    assert range_iceberg_entry_pauses([_limit_tier("only", "0.1")], "BUY", Decimal("0.05")) == {
+        "only": None,
+    }
+    assert range_iceberg_entry_pauses(tiers, "BUY", None) == {}
+
+    sells = [_limit_tier("s1", "0.08"), _limit_tier("s2", "0.09"), _limit_tier("s3", "0.10")]
+    mirrored = range_iceberg_entry_pauses(sells, "SELL", Decimal("0.095"))
+    assert mirrored["s1"] == "deeper tier s2 active"
+    assert mirrored["s2"] is None
+    assert mirrored["s3"] is None
+    above = range_iceberg_entry_pauses(sells, "SELL", Decimal("0.105"))
+    assert above["s2"] == "deeper tier s3 active"
+    assert above["s3"] is None
+
+    ranges = [
+        {
+            "executor_id": "r1",
+            "mode": "RANGE",
+            "price_low": Decimal("0.05"),
+            "price_high": Decimal("0.10"),
+            "unspent": True,
+        },
+        {
+            "executor_id": "r2",
+            "mode": "RANGE",
+            "price_low": Decimal("0.04"),
+            "price_high": Decimal("0.09"),
+            "unspent": True,
+        },
+    ]
+    assert range_iceberg_entry_pauses(ranges, "BUY", Decimal("0.089"))["r1"] == (
+        "deeper tier r2 active"
+    )
+
+
+def test_reference_price_uses_the_mid_then_the_mark():
+    from services.executor_service import _connector_reference_price
+
+    class Book:
+        def get_mid_price(self, _pair):
+            return Decimal("0.095")
+
+    assert _connector_reference_price(Book(), "AIOT-USDT") == Decimal("0.095")
+
+    class Mark:
+        def get_mid_price(self, _pair):
+            raise RuntimeError("no book")
+
+        def get_funding_info(self, _pair):
+            return SimpleNamespace(mark_price="0.09")
+
+    assert _connector_reference_price(Mark(), "AIOT-USDT") == Decimal("0.09")
+    assert _connector_reference_price(None, "AIOT-USDT") is None
+
+
+@pytest.mark.asyncio
+async def test_held_tiers_do_not_book_the_shared_position_twice():
+    service = _service()
+    infos = [
+        {
+            "open_base": "5",
+            "exchange_position_base": "7",
+            "side": "BUY",
+            "average_fill_price": "2",
+        },
+        {
+            "open_base": "5",
+            "exchange_position_base": "7",
+            "side": "BUY",
+            "average_fill_price": "2",
+        },
+    ]
+    metadata = _hold_metadata("range_iceberg_executor")
+    for index, info in enumerate(infos):
+        executor_id = f"tier-{index}"
+        service._active_executors[executor_id] = _HoldExecutor(info)
+        service._executor_metadata[executor_id] = metadata
+    service._active_executors.pop("tier-0")
+    await service._aggregate_position_hold("tier-0", _HoldExecutor(infos[0]), metadata)
+    service._active_executors.pop("tier-1")
+    await service._aggregate_position_hold("tier-1", _HoldExecutor(infos[1]), metadata)
+    position = next(iter(service._positions_held.values()))
+    assert position.buy_amount_base == Decimal("7")
+
+
+@pytest.mark.asyncio
+async def test_three_tiers_are_allowed_and_a_shared_stop_is_refused(db):
+    service = _open_service(db)
+    first = await service.create_executor(
+        _open_config("BUY", stop_loss={"price": "0.07"}, group_id="aiot-long"),
+        account_name="master",
+    )
+    assert service._executor_metadata[first["executor_id"]]["config"]["group_id"] == "aiot-long"
+    second = await service.create_executor(
+        _open_config("BUY", stop_loss={"price": "0.06"}),
+        account_name="master",
+    )
+    third = await service.create_executor(
+        _open_config("BUY", stop_loss={"price": "0.05"}),
+        account_name="master",
+    )
+    assert len({first["executor_id"], second["executor_id"], third["executor_id"]}) == 3
+    with pytest.raises(HTTPException) as duplicate:
+        await service.create_executor(
+            _open_config("BUY", stop_loss={"price": "0.070"}),
+            account_name="master",
+        )
+    assert duplicate.value.status_code == 409
+    assert "MEXC would overwrite" in duplicate.value.detail
+    assert first["executor_id"] in duplicate.value.detail
+    with pytest.raises(HTTPException) as patched:
+        await service.update_range_iceberg_config(
+            second["executor_id"],
+            {"stop_loss": {"price": "0.07"}},
+        )
+    assert patched.value.status_code == 409
+    assert "MEXC would overwrite" in patched.value.detail
+    cleared = await service.update_range_iceberg_config(
+        second["executor_id"],
+        {"stop_loss": None},
+    )
+    assert cleared["accepted"] is True
+    percent = await service.create_executor(
+        _open_config("BUY", stop_loss={"percent": "0.02"}),
+        account_name="master",
+    )
+    assert percent["executor_id"] not in {
+        first["executor_id"], second["executor_id"], third["executor_id"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_eleventh_tier_is_refused_until_an_external_close(db):
+    service = _open_service(db)
+    ids = []
+    for _ in range(10):
+        created = await service.create_executor(_open_config("BUY"), account_name="master")
+        ids.append(created["executor_id"])
+    with pytest.raises(HTTPException) as caught:
+        await service.create_executor(_open_config("BUY"), account_name="master")
+    assert caught.value.status_code == 409
+    assert caught.value.detail == _cap_detail()
+    executor = service._active_executors[ids[0]]
+    executor.close_type = SimpleNamespace(name="POSITION_CLOSED_EXTERNALLY")
+    executor.reported["external_close"] = True
+    executor.reported["open_base"] = "5"
+    opened = await service.create_executor(_open_config("BUY"), account_name="master")
+    assert opened["executor_id"] not in ids
+    assert ids[0] not in await _open_ids(service)
+
+
+@pytest.mark.asyncio
+async def test_sibling_hint_follows_a_partial_close_and_not_a_sibling_fill(db):
+    service = _open_service(db)
+    ids = []
+    for _ in range(3):
+        created = await service.create_executor(_open_config("BUY"), account_name="master")
+        ids.append(created["executor_id"])
+    for executor_id, opened in zip(ids, ("5", "3", "2")):
+        executor = service._active_executors[executor_id]
+        executor.reported["open_base"] = opened
+        executor.reported["exchange_position_base"] = "7"
+    service._sync_range_iceberg_sibling_hints()
+    sent = [service._active_executors[executor_id].sibling_calls[-1] for executor_id in ids]
+    assert sent == [Decimal("2"), Decimal("5"), Decimal("7")]
+
+    newest = service._active_executors[ids[2]]
+    newest.reported["open_base"] = "0"
+    for executor_id in ids:
+        service._active_executors[executor_id].reported["exchange_position_base"] = "8"
+    service._sync_range_iceberg_sibling_hints()
+    sent = [service._active_executors[executor_id].sibling_calls[-1] for executor_id in ids]
+    assert sent == [Decimal("3"), Decimal("5"), Decimal("8")]
+
+
+async def _limit_executors(db, side, limits):
+    service = _open_service(db)
+    ids = []
+    for limit in limits:
+        created = await service.create_executor(
+            _open_config(side, mode="UP_TO", limit_price=limit, total_amount="10"),
+            account_name="master",
+        )
+        executor_id = created["executor_id"]
+        ids.append(executor_id)
+        executor = service._active_executors[executor_id]
+        executor.reported["unfilled_amount"] = "10"
+        executor.reported["mode"] = "UP_TO"
+        executor.reported["limit_price"] = limit
+    return service, ids
+
+
+@pytest.mark.asyncio
+async def test_entry_pause_dwells_and_leaves_an_unknown_price_alone(db):
+    service, ids = await _limit_executors(db, "BUY", ("0.1", "0.09", "0.08"))
+    prices = {"value": Decimal("0.095")}
+    service._range_iceberg_reference_price = lambda *_args: prices["value"]
+
+    def calls(index):
+        return service._active_executors[ids[index]].entry_calls
+
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == []
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == [(False, None)]
+    assert calls(1) == [(False, None)]
+
+    prices["value"] = Decimal("0.089")
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == [(False, None)]
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0)[-1] == (True, f"deeper tier {ids[1]} active")
+
+    prices["value"] = None
+    frozen = list(calls(0))
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == frozen
+
+    prices["value"] = Decimal("0.095")
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == frozen
+    prices["value"] = Decimal("0.089")
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0) == frozen
+
+    service._active_executors[ids[1]].reported["unfilled_amount"] = "0"
+    prices["value"] = Decimal("0.089")
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0)[-1] == (False, None)
+
+    service._active_executors[ids[1]].reported["unfilled_amount"] = "10"
+    prices["value"] = Decimal("0.079")
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0)[-1] == (True, f"deeper tier {ids[1]} active")
+    assert calls(1)[-1] == (True, f"deeper tier {ids[2]} active")
+    assert calls(2)[-1] == (False, None)
+
+    prices["value"] = Decimal("0.095")
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    assert calls(0)[-1] == (False, None)
+    assert calls(1)[-1] == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_entry_pause_mirrors_sell_limits(db):
+    service, ids = await _limit_executors(db, "SELL", ("0.08", "0.09", "0.10"))
+    prices = {"value": Decimal("0.095")}
+    service._range_iceberg_reference_price = lambda *_args: prices["value"]
+    service._sync_range_iceberg_entry_pauses()
+    service._sync_range_iceberg_entry_pauses()
+    calls = service._active_executors[ids[0]].entry_calls
+    assert calls[-1] == (True, f"deeper tier {ids[1]} active")
+    assert service._active_executors[ids[1]].entry_calls[-1] == (False, None)

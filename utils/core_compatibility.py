@@ -1,9 +1,10 @@
 """Refuse to start against a hummingbot core that predates what this API reads.
 
 ``environment.yml`` pins ``hummingbot`` to ayj777/hummingbot commit
-``c050b13336928d21da9a5b3e6daaa72c3ff4e8c6`` (PR #9 on master). Those changes
-are not in a PyPI release yet. An image built from an older core comes up
-without the fields this API reads.
+``5dff9b51f1b8d870c7f120ad5cea922651502c06`` (PR #10 head, not merged).
+Move the pin to the squash commit on master after that PR merges. Those
+changes are not in a PyPI release yet. An image built from an older core
+comes up without the fields this API reads.
 
 Nothing complains when that happens. ``_persist_executor_completed`` reads the executor's
 figures inside a broad ``except Exception`` that logs at DEBUG and substitutes zeros, so a
@@ -22,6 +23,16 @@ REQUIRED_CORE_SURFACE: List[Tuple[str, str, str]] = [
         "hummingbot.strategy_v2.models.executors:CloseType",
         "POSITION_CLOSED_EXTERNALLY",
         "an external full close, stored as close type 11",
+    ),
+    (
+        "hummingbot.strategy_v2.executors.range_iceberg_executor.data_types:RangeIcebergExecutorConfig",
+        "group_id",
+        "optional label on a range iceberg that shares a side",
+    ),
+    (
+        "hummingbot.strategy_v2.executors.range_iceberg_executor.data_types:RangeIcebergExecutorConfig",
+        "sibling_base",
+        "live size a tier must leave for the other tiers on its side",
     ),
 ]
 

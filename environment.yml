@@ -20,12 +20,13 @@ dependencies:
   - docker-py
   - pip
   - pip:
-      # Pinned to ayj777/hummingbot master after PR #9, squash
-      # c050b13336928d21da9a5b3e6daaa72c3ff4e8c6. Those core changes are not in
+      # Pinned to ayj777/hummingbot PR #10 head, not merged yet.
+      # 5dff9b51f1b8d870c7f120ad5cea922651502c06. Move this pin to the squash
+      # commit on master after that PR merges. Those core changes are not in
       # a PyPI release yet. utils/core_compatibility.py refuses to start against
       # a core that is missing them, so a wrong install is a startup error
       # rather than a deployment that books zeros in silence.
-      - hummingbot @ git+https://github.com/ayj777/hummingbot.git@c050b13336928d21da9a5b3e6daaa72c3ff4e8c6
+      - hummingbot @ git+https://github.com/ayj777/hummingbot.git@5dff9b51f1b8d870c7f120ad5cea922651502c06
       - geckoterminal-py>=0.3.1
       - msgpack>=1.0.5
       - flake8
