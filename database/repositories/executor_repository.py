@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,7 +73,8 @@ class ExecutorRepository:
             cum_fees_quote: Optional[Decimal] = None,
             filled_amount_quote: Optional[Decimal] = None,
             final_state: Optional[str] = None,
-            error_log: Optional[str] = None
+            error_log: Optional[str] = None,
+            config: Optional[str] = None,
     ) -> Optional[ExecutorRecord]:
         """Update an executor record."""
         stmt = select(ExecutorRecord).where(ExecutorRecord.executor_id == executor_id)
@@ -98,6 +99,8 @@ class ExecutorRepository:
                 executor.final_state = final_state
             if error_log is not None:
                 executor.error_log = error_log
+            if config is not None:
+                executor.config = config
 
             await self.session.flush()
             await self.session.refresh(executor)
@@ -254,6 +257,34 @@ class ExecutorRepository:
 
         stmt = stmt.order_by(desc(ExecutorRecord.created_at))
 
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_open_executors_for_pair(
+            self,
+            executor_type: str,
+            account_name: str,
+            connector_name: str,
+    ) -> List[ExecutorRecord]:
+        """Slot candidates for this account and connector.
+
+        A non-terminated row still holds a slot. A TERMINATED row closed
+        POSITION_HOLD can too, while the parked position or its exchange
+        stop is still there. The caller matches the pair after normalizing
+        it, so ``btc-usdt`` and ``BTC-USDT`` are the same slot.
+        """
+        stmt = select(ExecutorRecord).where(
+            ExecutorRecord.executor_type == executor_type,
+            ExecutorRecord.account_name == account_name,
+            ExecutorRecord.connector_name == connector_name,
+            or_(
+                ExecutorRecord.status != "TERMINATED",
+                and_(
+                    ExecutorRecord.status == "TERMINATED",
+                    ExecutorRecord.close_type == "POSITION_HOLD",
+                ),
+            ),
+        )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 

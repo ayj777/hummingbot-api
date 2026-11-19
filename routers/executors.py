@@ -22,7 +22,11 @@ from models.executors import (
     PerformanceReportResponse,
     PositionHoldResponse,
     PositionsSummaryResponse,
+    ReleaseRangeIcebergSlotRequest,
+    ReleaseRangeIcebergSlotResponse,
     StopExecutorRequest,
+    UpdateRangeIcebergRequest,
+    UpdateRangeIcebergResponse,
     StopExecutorResponse,
 )
 from models.pagination import PaginatedResponse
@@ -60,6 +64,14 @@ async def create_executor(
     - Additional type-specific configuration (see /executors/types/{type}/config for details)
 
     Returns the created executor ID and initial status.
+
+    A second range iceberg on the same account, connector, trading pair, and
+    side is rejected with 409. The detail names the executor that holds the
+    slot. A stop that keeps the position still holds the slot until the
+    exchange position is flat or POST /executors/range-iceberg/release-slot
+    marks it released. A long and a short on the same pair are both allowed,
+    and so is the same side on a different account. The pair match ignores
+    case and treats '_' and '/' as '-'.
     """
     try:
         result = await executor_service.create_executor(
@@ -73,6 +85,78 @@ async def create_executor(
     except Exception as e:
         logger.error(f"Error creating executor: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error creating executor: {str(e)}")
+
+
+@router.post(
+    "/range-iceberg/release-slot",
+    response_model=ReleaseRangeIcebergSlotResponse,
+)
+async def release_range_iceberg_slot(
+    request: ReleaseRangeIcebergSlotRequest,
+    executor_service: ExecutorService = Depends(get_executor_service),
+):
+    """
+    Release a parked range iceberg slot so a new executor can start on it.
+
+    Only a TERMINATED POSITION_HOLD row can be released. A row that has not
+    terminated is refused with 409, because it will resume on restart.
+
+    Release does not close the position or cancel the parked exchange stop.
+    A new same-side executor runs on the software stop loss only. Its
+    exchange stop is refused until the parked stop is gone. The response
+    body repeats that warning.
+    """
+    try:
+        result = await executor_service.release_range_iceberg_slot(
+            account_name=request.account_name,
+            connector_name=request.connector_name,
+            trading_pair=request.trading_pair,
+            side=request.side,
+            executor_id=request.executor_id,
+        )
+        return ReleaseRangeIcebergSlotResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error releasing range iceberg slot: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error releasing range iceberg slot: {str(e)}")
+
+
+@router.patch("/{executor_id}/range-iceberg", response_model=UpdateRangeIcebergResponse)
+async def update_range_iceberg(
+    executor_id: str,
+    request: UpdateRangeIcebergRequest,
+    executor_service: ExecutorService = Depends(get_executor_service),
+):
+    """
+    Edit a live range iceberg in place.
+
+    The body may set any subset of total_amount, price_low, price_high,
+    take_profit, and stop_loss. Decimals are strings or numbers. An exit
+    object may set percent, price, execution, order_type, slices,
+    visible_count, interval, limit_price, price_low, and price_high.
+    Null clears that exit. Omitted keys are unchanged.
+
+    The executor must be the live in-memory range iceberg. A missing
+    executor, or one that is not a range iceberg, is 404. A parked row is
+    not changed. The executor validates the edit and queues it for the next
+    tick. Accepted edits return 200 ``{accepted, reason, executor_id}`` and
+    are stored as pending ``config_edits``. The saved config changes when
+    the executor reports the edit applied. A rejected edit returns 409 and
+    changes nothing. ``pending_config_edit``, ``config_edit_error``, and
+    ``config_edit_note`` on an executor response come from custom_info.
+    """
+    try:
+        result = await executor_service.update_range_iceberg_config(
+            executor_id=executor_id,
+            changes=request.changes(),
+        )
+        return UpdateRangeIcebergResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error editing range iceberg {executor_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error editing range iceberg: {str(e)}")
 
 
 @router.post("/search", response_model=PaginatedResponse)

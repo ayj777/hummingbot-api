@@ -6,7 +6,7 @@ validation for the REST API.
 """
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
@@ -315,6 +315,102 @@ class StopExecutorRequest(BaseModel):
     )
 
 
+class ReleaseRangeIcebergSlotRequest(BaseModel):
+    """Release a parked range iceberg so another can start on its slot."""
+    account_name: str = Field(
+        ...,
+        description="Account that owns the parked executor"
+    )
+    connector_name: str = Field(..., description="Connector name")
+    trading_pair: str = Field(
+        ...,
+        description="Trading pair. Case and '_' or '/' separators are normalized."
+    )
+    side: str = Field(
+        ...,
+        description="BUY or SELL. LONG counts as BUY and SHORT as SELL."
+    )
+    executor_id: Optional[str] = Field(
+        None,
+        description="Parked executor to release. When omitted, the occupant of this slot is released."
+    )
+
+
+class ReleaseRangeIcebergSlotResponse(BaseModel):
+    """The parked executor whose slot was released.
+
+    Release does not close the position or cancel the parked exchange stop.
+    A new same-side executor runs on the software stop loss only. Its
+    exchange stop is refused until the parked stop is gone.
+    """
+    executor_id: str
+    released: bool
+    trading_pair: str
+    side: str
+    account_name: str
+    position_closed: bool = False
+    exchange_stop_cancelled: bool = False
+    warning: str = Field(
+        ...,
+        description=(
+            "Release does not close the position or cancel the parked exchange stop. "
+            "A new same-side executor runs on the software stop loss only. "
+            "Its exchange stop is refused until the parked stop is gone."
+        ),
+    )
+
+
+_EDIT_NUMBER = Union[str, int, float, Decimal]
+
+
+class RangeIcebergExitEdit(BaseModel):
+    """One take-profit or stop-loss object on a range iceberg edit."""
+    model_config = ConfigDict(extra="forbid")
+    percent: Optional[_EDIT_NUMBER] = None
+    price: Optional[_EDIT_NUMBER] = None
+    execution: Optional[str] = None
+    order_type: Optional[str] = None
+    slices: Optional[int] = None
+    visible_count: Optional[int] = None
+    interval: Optional[_EDIT_NUMBER] = None
+    limit_price: Optional[_EDIT_NUMBER] = None
+    price_low: Optional[_EDIT_NUMBER] = None
+    price_high: Optional[_EDIT_NUMBER] = None
+
+
+class UpdateRangeIcebergRequest(BaseModel):
+    """In-place edit of a live range iceberg. Omitted keys are left alone.
+
+    ``take_profit`` or ``stop_loss`` set to null clears that exit.
+    """
+    model_config = ConfigDict(extra="forbid")
+    total_amount: Optional[_EDIT_NUMBER] = None
+    price_low: Optional[_EDIT_NUMBER] = None
+    price_high: Optional[_EDIT_NUMBER] = None
+    take_profit: Optional[RangeIcebergExitEdit] = None
+    stop_loss: Optional[RangeIcebergExitEdit] = None
+
+    def changes(self) -> Dict[str, Any]:
+        """Only the keys the caller sent, including an explicit null."""
+        payload: Dict[str, Any] = {}
+        for key in ("total_amount", "price_low", "price_high", "take_profit", "stop_loss"):
+            if key not in self.model_fields_set:
+                continue
+            value = getattr(self, key)
+            if isinstance(value, BaseModel):
+                payload[key] = value.model_dump(exclude_unset=True)
+            else:
+                payload[key] = value
+        return payload
+
+
+class UpdateRangeIcebergResponse(BaseModel):
+    """An accepted range iceberg edit."""
+    accepted: bool
+    reason: str
+    executor_id: str
+
+
 class ExecutorFilterRequest(PaginationParams):
     """Request to filter and list executors."""
     account_names: Optional[List[str]] = Field(
@@ -400,6 +496,22 @@ class ExecutorResponse(BaseModel):
                     "it has earned none.")
     error_count: int = Field(default=0, description="Number of ERROR-level log entries captured")
     last_error: Optional[str] = Field(default=None, description="Most recent error message, if any")
+    pending_config_edit: bool = Field(
+        default=False,
+        description="True while an accepted range iceberg edit is queued and not yet applied",
+    )
+    config_edit_error: Optional[str] = Field(
+        default=None,
+        description="Why a queued range iceberg edit was dropped, when the executor reported one",
+    )
+    config_edit_note: Optional[str] = Field(
+        default=None,
+        description="Note on an applied range iceberg edit, such as a clamp or pending cancels",
+    )
+    size_unit: Optional[str] = Field(
+        default=None,
+        description="Size unit the executor reports (BASE, QUOTE, or CONTRACTS)",
+    )
 
 
 class ExecutorDetailResponse(ExecutorResponse):

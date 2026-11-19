@@ -1,9 +1,9 @@
 """Refuse to start against a hummingbot core that predates what this API reads.
 
-``environment.yml`` installs ``hummingbot`` unpinned from PyPI, because the changes this
-version depends on are not in a release yet. That makes the install order load-bearing:
-build the image before the core ships and the API comes up against a core without the
-fields it reads.
+``environment.yml`` pins ``hummingbot`` to ayj777/hummingbot commit
+``7bcfbca70191dbf1ebc1ed8725e85fedeb718505`` (PR #8 on master). Those changes
+are not in a PyPI release yet. An image built from an older core comes up
+without the fields this API reads.
 
 Nothing complains when that happens. ``_persist_executor_completed`` reads the executor's
 figures inside a broad ``except Exception`` that logs at DEBUG and substitutes zeros, so a

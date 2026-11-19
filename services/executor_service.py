@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type
 
 from fastapi import HTTPException
@@ -63,8 +64,25 @@ _TERMINAL_ORDER_STATUSES = {
     "DONE",
 }
 _SKIP_ORDER_IDS = {"", "skipped"}
-_ORDER_LIST_KEYS = ("child_order_ids", "order_ids", "unknown_order_ids", "active_order_ids")
+_ORDER_LIST_KEYS = (
+    "child_order_ids",
+    "order_ids",
+    "unknown_order_ids",
+    "active_order_ids",
+    # Take-profit and stop-loss children, including iceberg exit slices.
+    "exit_order_ids",
+)
 _LEVEL_KEYS = ("levels", "orders")
+# Graceful shutdown persists these so startup can restore the executor and its
+# exchange-side stop. TRIGGERED, DONE, and NONE stay on the ordinary cancel path.
+_RESUMABLE_EXIT_STATES = frozenset({"ARMED", "RESTING", "CLOSING"})
+_RESUME_ON_STARTUP = "resume_on_startup"
+_RESUME_FAILED = "resume_failed"
+_RESUME_ERROR = "resume_error"
+_RESUME_ENTRIES = "resume_entries"
+_CLOSED_WHILE_DOWN = "CLOSED_WHILE_DOWN"
+_EXCHANGE_STOP_CANCELLED = "exchange_stop_cancelled"
+_API_RESUME_KEYS = frozenset({_RESUME_ON_STARTUP, _RESUME_FAILED, _RESUME_ERROR})
 
 
 def _order_id_text(value: Any) -> Optional[str]:
@@ -88,10 +106,12 @@ def _is_filled_marker(item: Dict[str, Any]) -> bool:
 def child_order_ids_from_custom_info(custom_info: Any) -> tuple[List[str], List[str]]:
     """Split custom_info into working child order ids and filled ones.
 
-    Range iceberg reports ``child_order_ids`` plus per-level ``filled`` flags.
+    Range iceberg reports ``child_order_ids`` plus ``exit_order_ids`` (every exit
+    client order id, including iceberg children) and per-level ``filled`` flags.
     Position, DCA and TWAP report ``order_ids``. Order executor reports a single
     ``order_id``. Filled ids and ``held_position_orders`` are the exposure to keep,
-    not orders to cancel.
+    not orders to cancel. ``exchange_stop_order_id`` and ``exchange_stop_order_ids``
+    are exchange stops, not software orders to cancel here.
     """
     if not isinstance(custom_info, dict):
         return [], []
@@ -140,6 +160,606 @@ def child_order_ids_from_custom_info(custom_info: Any) -> tuple[List[str], List[
 
     working = [oid for oid in working if oid not in seen_filled]
     return working, filled
+
+
+def _parse_stored_custom_info(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _exit_state_name(custom_info: Any) -> Optional[str]:
+    """``exit_state`` uppercased, or None when the field is absent."""
+    if not isinstance(custom_info, dict) or "exit_state" not in custom_info:
+        return None
+    value = custom_info.get("exit_state")
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name.strip():
+        text = name
+    else:
+        raw = getattr(value, "value", value)
+        text = raw if isinstance(raw, str) else str(raw)
+    text = text.strip().upper()
+    return text or None
+
+
+def _exchange_stop_ids(custom_info: Any) -> List[str]:
+    """Every live exchange stop id for this executor.
+
+    ``exchange_stop_order_ids`` is the full list. The primary
+    ``exchange_stop_order_id`` is included when that list is absent or does
+    not already contain it.
+    """
+    if not isinstance(custom_info, dict):
+        return []
+    ids: List[str] = []
+    seen: set = set()
+
+    def add(value: Any) -> None:
+        oid = _order_id_text(value) if not isinstance(value, dict) else _dict_order_id(value)
+        if oid and oid not in seen:
+            seen.add(oid)
+            ids.append(oid)
+
+    listed = custom_info.get("exchange_stop_order_ids")
+    if isinstance(listed, list):
+        for item in listed:
+            add(item)
+    else:
+        add(custom_info.get("exchange_stop_order_id"))
+        return ids
+    add(custom_info.get("exchange_stop_order_id"))
+    return ids
+
+
+def _exchange_stop_id(custom_info: Any) -> Optional[str]:
+    """Primary exchange stop id, or the first id when only the list is set."""
+    if isinstance(custom_info, dict):
+        primary = _order_id_text(custom_info.get("exchange_stop_order_id"))
+        if primary:
+            return primary
+    ids = _exchange_stop_ids(custom_info)
+    return ids[0] if ids else None
+
+
+def _exchange_stop_text(custom_info: Any) -> str:
+    ids = _exchange_stop_ids(custom_info)
+    return ", ".join(ids) if ids else "none"
+
+
+def _range_iceberg_side_name(value: Any) -> str:
+    """Position side for the one-open-iceberg slot.
+
+    BUY and LONG are one side. SELL and SHORT are the other. A missing
+    side counts as BUY, which is the executor default.
+    """
+    name = getattr(value, "name", value)
+    text = str(name or "").strip().upper()
+    if text in {"SELL", "SHORT"}:
+        return "SELL"
+    return "BUY"
+
+
+def _normalize_trading_pair(value: Any) -> str:
+    """Upper case, with '_' and '/' written as '-'.
+
+    ``btc-usdt``, ``btc_usdt`` and ``BTC/USDT`` are one pair. An empty
+    value stays empty.
+    """
+    return str(value or "").strip().upper().replace("_", "-").replace("/", "-")
+
+
+_RANGE_ICEBERG_EDIT_KEYS = (
+    "total_amount",
+    "price_low",
+    "price_high",
+    "take_profit",
+    "stop_loss",
+)
+# size_unit travels with config_edits so a later restart knows the unit of
+# total_amount. It is not one of the PATCH fields.
+_CONFIG_EDIT_CARRY_KEYS = _RANGE_ICEBERG_EDIT_KEYS + ("size_unit",)
+
+
+def _json_edit_value(value: Any) -> Any:
+    """A config edit stored as JSON text.
+
+    Numbers become decimal strings so a restart reads the same value the
+    executor accepted. Nested exit objects are copied the same way. Null
+    stays null and clears that exit.
+    """
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, float):
+        return format(Decimal(str(value)), "f")
+    if isinstance(value, dict):
+        return {str(key): _json_edit_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_edit_value(item) for item in value]
+    return value
+
+
+def _config_edits_source(custom: Any) -> Dict[str, Any]:
+    """The ``config_edits`` object, or empty when the edit was dropped."""
+    if not isinstance(custom, dict):
+        return {}
+    if custom.get("config_edit_error") not in (None, ""):
+        return {}
+    source = custom.get("config_edits")
+    if not isinstance(source, dict):
+        return {}
+    return source
+
+
+def _range_iceberg_edit_overlay(custom: Any) -> Dict[str, Any]:
+    """User edits stored on ``config_edits``.
+
+    ``total_amount``, ``price_low``, ``price_high``, ``take_profit``, and
+    ``stop_loss`` on custom_info itself are reporting fields. The executor
+    always emits them, in its own size unit. They are not an edit. A dropped
+    edit sets ``config_edit_error`` and is not applied. ``config_edit_note``
+    is a note on an applied edit and does not drop it. ``size_unit`` on
+    ``config_edits`` is the unit of that edit, not a reporting field.
+    """
+    source = _config_edits_source(custom)
+    return {key: source[key] for key in _RANGE_ICEBERG_EDIT_KEYS if key in source}
+
+
+def _total_amount_in_base(
+    amount: Any,
+    size_unit: Any,
+    price: Optional[Decimal],
+    contract_size: Optional[Decimal],
+) -> Optional[Decimal]:
+    """Edited ``total_amount`` converted into base.
+
+    ``config_edits`` stores the amount in the executor's own size unit.
+    Resume forces ``size_unit`` BASE, so a quote or contract amount has to
+    be converted before it replaces the open base. None means the amount
+    cannot be converted and the caller keeps the open base.
+    """
+    if amount is None or amount == "":
+        return None
+    try:
+        value = Decimal(str(amount))
+    except Exception:
+        return None
+    unit = str(size_unit or "BASE").strip().upper()
+    if unit in ("", "BASE"):
+        return value
+    if unit == "QUOTE":
+        if price is None or price <= 0:
+            return None
+        return value / price
+    if unit == "CONTRACTS":
+        if contract_size is None or contract_size <= 0:
+            return None
+        return value * contract_size
+    return value
+
+
+def _edit_size_unit(custom: Any, size_unit: Any) -> Any:
+    """Unit of an edited total_amount.
+
+    ``config_edits.size_unit`` wins over the saved config. A resume rewrites
+    the running config to BASE, and the executor reports that unit on the
+    next edit. The config column can still say QUOTE until that write lands.
+    """
+    source = _config_edits_source(custom)
+    reported = source.get("size_unit")
+    if reported not in (None, ""):
+        return reported
+    return size_unit
+
+
+def _resume_edits_in_base(
+    custom: Any,
+    size_unit: Any,
+    price: Optional[Decimal],
+    contract_size: Optional[Decimal],
+) -> Dict[str, Any]:
+    """config_edits for a BASE resume. ``total_amount`` is converted."""
+    edited = _range_iceberg_edit_overlay(custom)
+    if "total_amount" not in edited:
+        return edited
+    unit = _edit_size_unit(custom, size_unit)
+    converted = _total_amount_in_base(
+        edited.get("total_amount"), unit, price, contract_size,
+    )
+    if converted is None:
+        logger.error(
+            "Could not convert edited total_amount %s from %s into base. "
+            "Resuming on the open base.",
+            edited.get("total_amount"),
+            unit or "BASE",
+        )
+        edited = dict(edited)
+        edited.pop("total_amount", None)
+        return edited
+    edited = dict(edited)
+    edited["total_amount"] = format(converted, "f")
+    return edited
+
+
+def _fold_reported_config_edit(stored: Any, reported: Any) -> tuple:
+    """Carry a pending edit, or accept the one the executor says it applied.
+
+    Returns the custom_info to store and the edit to merge into the saved
+    config. The saved config stays unchanged until ``pending_config_edit``
+    is false and ``config_edits`` is present. A ``config_edit_error`` means
+    the edit was not applied and will not be, so the pending edit is
+    dropped. A ``config_edit_note`` means the edit was applied, with a note
+    such as a clamp or cancels still pending. The note does not drop the
+    edit. While ``pending_config_edit`` is true the pending edit is kept,
+    note or not. Reporting fields are left as the executor sent them.
+    """
+    payload = dict(reported) if isinstance(reported, dict) else {}
+    stored_dict = stored if isinstance(stored, dict) else {}
+
+    def _picked(source: Any) -> Dict[str, Any]:
+        if not isinstance(source, dict):
+            return {}
+        return {key: source[key] for key in _CONFIG_EDIT_CARRY_KEYS if key in source}
+
+    note = payload.get("config_edit_note")
+    if note in (None, ""):
+        payload.pop("config_edit_note", None)
+    else:
+        payload["config_edit_note"] = str(note)
+
+    # Only config_edit_error drops a pending edit. config_edit_note does not.
+    error = payload.get("config_edit_error")
+    if error not in (None, ""):
+        payload["config_edit_error"] = str(error)
+        payload["pending_config_edit"] = False
+        payload.pop("config_edits", None)
+        return payload, None
+
+    reported_edits = _picked(payload.get("config_edits")) if "config_edits" in payload else None
+    if "pending_config_edit" in payload and payload.get("pending_config_edit") is False:
+        if reported_edits:
+            payload["config_edits"] = reported_edits
+            payload["pending_config_edit"] = False
+            return payload, reported_edits
+        payload.pop("config_edits", None)
+        payload["pending_config_edit"] = False
+        return payload, None
+
+    if reported_edits is not None:
+        payload["config_edits"] = reported_edits
+        if "pending_config_edit" not in payload and "pending_config_edit" in stored_dict:
+            payload["pending_config_edit"] = stored_dict.get("pending_config_edit") is True
+        return payload, None
+
+    stored_edits = _picked(stored_dict.get("config_edits"))
+    if stored_edits:
+        payload["config_edits"] = stored_edits
+        if "pending_config_edit" in stored_dict:
+            payload["pending_config_edit"] = stored_dict.get("pending_config_edit") is True
+    return payload, None
+
+
+def _config_json_with_applied_edit(record: Any, applied: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Merge an applied edit into the saved config.
+
+    ``size_unit`` is written with ``total_amount``. After a resume the
+    executor's amount is base, and the column has to say so. Leaving QUOTE
+    on the column makes the next restart divide that base amount again.
+    """
+    if not applied or record is None:
+        return None
+    raw = getattr(record, "config", None)
+    try:
+        config = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Saved config is not JSON, so the applied edit was not stored on it")
+        return None
+    if not isinstance(config, dict):
+        return None
+    config.update({key: _json_edit_value(value) for key, value in applied.items()})
+    return json.dumps(config, default=_json_default)
+
+
+def _config_edit_response_fields(custom_info: Any) -> Dict[str, Any]:
+    """Edit status fields for an executor response."""
+    info = custom_info if isinstance(custom_info, dict) else {}
+    error = info.get("config_edit_error")
+    note = info.get("config_edit_note")
+    size_unit = info.get("size_unit")
+    return {
+        "pending_config_edit": info.get("pending_config_edit") is True,
+        "config_edit_error": None if error in (None, "") else str(error),
+        "config_edit_note": None if note in (None, "") else str(note),
+        "size_unit": None if size_unit in (None, "") else str(size_unit),
+    }
+
+
+_RELEASE_LEAVES_THE_POSITION = (
+    "Release does not close the position or cancel the parked exchange stop. "
+    "A new same-side executor runs on the software stop loss only. "
+    "Its exchange stop is refused until the parked stop is gone."
+)
+
+
+def _open_base_is_zero(custom_info: Any) -> bool:
+    """True when ``open_base`` is present and zero.
+
+    A missing field is not treated as a closed position.
+    """
+    if not isinstance(custom_info, dict) or "open_base" not in custom_info:
+        return False
+    value = custom_info.get("open_base")
+    if value is None or value == "":
+        return False
+    try:
+        amount = Decimal(str(value))
+    except Exception:
+        return False
+    return amount == 0
+
+
+def _reported_decimal(executor: Any, custom_info: Any, key: str) -> Optional[Decimal]:
+    if isinstance(custom_info, dict) and key in custom_info and custom_info.get(key) is not None:
+        value = custom_info.get(key)
+    elif executor is not None and hasattr(executor, key):
+        value = getattr(executor, key)
+        if callable(value):
+            return None
+    else:
+        return None
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def range_iceberg_held_base(executor: Any, custom_info: Any) -> Optional[Decimal]:
+    """Base still held by a range iceberg.
+
+    ``open_base`` when that field is present. Otherwise ``filled_base`` minus
+    ``closed_base`` when both are present. Otherwise ``filled_base``. None when
+    none of those fields were reported, so the caller can use the generic fill.
+    """
+    open_base = _reported_decimal(executor, custom_info, "open_base")
+    if open_base is not None:
+        return open_base if open_base > 0 else Decimal("0")
+    filled = _reported_decimal(executor, custom_info, "filled_base")
+    closed = _reported_decimal(executor, custom_info, "closed_base")
+    if filled is not None and closed is not None:
+        net = filled - closed
+        return net if net > 0 else Decimal("0")
+    if filled is not None:
+        return filled if filled > 0 else Decimal("0")
+    return None
+
+
+def _stored_position_hold_keeps_slot(custom_info: Any) -> bool:
+    """A parked hold still has base, or it still names an exchange stop."""
+    if not isinstance(custom_info, dict):
+        return False
+    held = range_iceberg_held_base(None, custom_info)
+    if held is not None and held > 0:
+        return True
+    return bool(_exchange_stop_ids(custom_info))
+
+
+def range_iceberg_held_quote(executor: Any, custom_info: Any, held_base: Optional[Decimal]) -> Optional[Decimal]:
+    """Quote still held, sized to ``held_base`` times the average entry.
+
+    The executor's filled quote is the whole entry. A partly closed iceberg
+    keeps only the open base, so the quote is that base times the average
+    entry price. None when the average was not reported.
+    """
+    if held_base is None:
+        return None
+    if held_base <= 0:
+        return Decimal("0")
+    average = _average_entry_price(executor, custom_info)
+    if average is None or average <= 0:
+        return None
+    return held_base * average
+
+
+def _average_entry_price(executor: Any, custom_info: Any) -> Optional[Decimal]:
+    for key in ("average_fill_price", "average_entry_price"):
+        price = _reported_decimal(executor, custom_info, key)
+        if price is not None and price > 0:
+            return price
+    filled = _reported_decimal(executor, custom_info, "filled_base")
+    if filled is None or filled <= 0:
+        filled = _reported_decimal(executor, custom_info, "filled_amount_base")
+    quote = _reported_decimal(executor, custom_info, "filled_quote")
+    if quote is None:
+        quote = _reported_decimal(executor, custom_info, "filled_amount_quote")
+    if quote is None:
+        quote = _reported_decimal(executor, custom_info, "entry_filled_quote")
+    if filled is not None and filled > 0 and quote is not None and quote > 0:
+        return quote / filled
+    return None
+
+
+def _entry_average_from_saved(custom: Dict[str, Any]) -> Optional[Decimal]:
+    """Average price of the entry fills, ignoring exit fills.
+
+    A partial take profit stores its own quote on the exit. Dividing that
+    quote by the remaining base is not the entry average.
+    """
+    filled = _reported_decimal(None, custom, "filled_base")
+    if filled is None or filled <= 0:
+        filled = _reported_decimal(None, custom, "filled_amount_base")
+    quote = _reported_decimal(None, custom, "filled_quote")
+    if quote is None or quote <= 0:
+        quote = _reported_decimal(None, custom, "filled_amount_quote")
+    exit_blob = custom.get("exit") if isinstance(custom.get("exit"), dict) else {}
+    if (filled is None or filled <= 0) and exit_blob:
+        filled = _reported_decimal(None, exit_blob, "entry_filled_base")
+    if (quote is None or quote <= 0) and exit_blob:
+        quote = _reported_decimal(None, exit_blob, "entry_filled_quote")
+    if filled is not None and filled > 0 and quote is not None and quote > 0:
+        return quote / filled
+    for key in ("average_fill_price", "average_entry_price"):
+        price = _reported_decimal(None, custom, key)
+        if price is not None and price > 0:
+            return price
+    return None
+
+
+def _prices_are_consistent(left: Decimal, right: Decimal) -> bool:
+    scale = max(abs(left), abs(right))
+    if scale <= 0:
+        return False
+    return abs(left - right) / scale <= Decimal("0.01")
+
+
+def _resume_entry_average(
+    custom: Dict[str, Any],
+    exchange_entry_price: Optional[Decimal],
+) -> Optional[Decimal]:
+    """Entry average for the restored position.
+
+    Prefer the saved entry fills. Use the exchange position's entry price when
+    it is the only price we have, or when it agrees with those fills. A price
+    that disagrees is another position on the same side, so the saved fills win.
+    """
+    saved = _entry_average_from_saved(custom)
+    exchange = exchange_entry_price if exchange_entry_price is not None and exchange_entry_price > 0 else None
+    if saved is not None and exchange is not None and not _prices_are_consistent(saved, exchange):
+        logger.warning(
+            "Exchange entry price %s does not match saved entry average %s. "
+            "Resuming on the saved entry average.",
+            exchange,
+            saved,
+        )
+        return saved
+    if saved is not None:
+        return saved
+    return exchange
+
+
+def _exit_phase_for_state(exit_state: Any) -> str:
+    name = str(exit_state or "").strip().upper()
+    return {
+        "ARMED": "armed",
+        "RESTING": "resting",
+        "TRIGGERED": "cancelling_entry",
+        "CLOSING": "executing",
+        "DONE": "done",
+    }.get(name, "armed")
+
+
+def _exit_only_custom_info(
+    custom: Dict[str, Any],
+    open_base: Decimal,
+    average: Optional[Decimal],
+    edits: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Clean restore payload that continues exits only.
+
+    A resumed range iceberg does not continue an unfinished entry. The payload
+    is not a copy of the saved custom_info: a partial take profit's
+    filled_by_order and exit quote would make the remaining base look like it
+    was entered at the wrong price, and the stop would fire at once.
+
+    ``size_unit`` is BASE. ``open_base`` is the position the exit may close.
+    Entry quote is that base times the entry average. Startup still cancels
+    the old client order ids from the saved row. ``exchange_stop_released``,
+    when the saved info has it, is copied onto the top level and the exit
+    section so a resumed stop-loss close does not place a new exchange stop.
+    """
+    amount = format(open_base, "f")
+    quote = "0" if average is None or average <= 0 else format(open_base * average, "f")
+    average_text = None if average is None or average <= 0 else format(average, "f")
+    exit_blob = custom.get("exit") if isinstance(custom.get("exit"), dict) else {}
+    exit_state = custom.get("exit_state") or exit_blob.get("exit_state")
+    active = custom.get("exit_active") or exit_blob.get("active")
+    stop_ids = _exchange_stop_ids(custom)
+    payload: Dict[str, Any] = {
+        _RESUME_ENTRIES: False,
+        "size_unit": "BASE",
+        "side": custom.get("side"),
+        "mode": custom.get("mode"),
+        "exit_state": exit_state,
+        "exit_active": active,
+        "open_base": amount,
+        "filled_base": amount,
+        "closed_base": "0",
+        "filled_quote": quote,
+        "average_fill_price": average_text,
+        "exchange_stop_order_id": _exchange_stop_id(custom),
+        "exchange_stop_order_ids": stop_ids,
+        "child_order_ids": [],
+        "exit_order_ids": [],
+    }
+    if "schedule_clock" in custom:
+        payload["schedule_clock"] = custom.get("schedule_clock")
+    if "schedule_started_at" in custom:
+        payload["schedule_started_at"] = custom.get("schedule_started_at")
+    payload["exit"] = {
+        "active": active,
+        "status": _exit_phase_for_state(exit_state),
+        "exit_state": exit_state,
+        "exchange_stop_order_id": _exchange_stop_id(custom),
+        "exchange_stop_order_ids": stop_ids,
+        "trigger_price": exit_blob.get("trigger_price"),
+        "entry_filled_base": amount,
+        "entry_filled_quote": quote,
+        "filled_base": "0",
+        "filled_quote": "0",
+        "average_price": average_text,
+        "order_ids": [],
+        "filled_by_order": {},
+        "started_at": exit_blob.get("started_at"),
+        "paused_seconds": exit_blob.get("paused_seconds") or 0,
+    }
+    if "exchange_stop_released" in custom:
+        released = custom.get("exchange_stop_released")
+    elif "exchange_stop_released" in exit_blob:
+        released = exit_blob.get("exchange_stop_released")
+    else:
+        released = None
+    if "exchange_stop_released" in custom or "exchange_stop_released" in exit_blob:
+        payload["exchange_stop_released"] = released
+        payload["exit"]["exchange_stop_released"] = released
+    # edits is already in base. Only config_edits is an edit. The reporting
+    # total_amount on custom_info is the original size unit and is not copied.
+    edited = edits if isinstance(edits, dict) else _resume_edits_in_base(
+        custom, "BASE", average, None,
+    )
+    payload.update(edited)
+    if "total_amount" in edited:
+        payload["target_amount"] = edited["total_amount"]
+    return payload
+
+
+def _resume_search_fields(custom_info: Any) -> Dict[str, Any]:
+    """Fields Condor reads from an executor search row."""
+    info = custom_info if isinstance(custom_info, dict) else {}
+    error = info.get("exchange_stop_error")
+    resume_error = info.get(_RESUME_ERROR)
+    return {
+        "resume_failed": bool(info.get(_RESUME_FAILED)),
+        "resume_error": None if resume_error in (None, "") else str(resume_error),
+        "exchange_stop_error": None if error in (None, "") else str(error),
+    }
+
+
+def _live_order_ids_from_custom(custom_info: Any) -> List[str]:
+    working, _filled = child_order_ids_from_custom_info(custom_info)
+    ids = list(working)
+    for stop_id in _exchange_stop_ids(custom_info):
+        if stop_id not in ids:
+            ids.append(stop_id)
+    return ids
 
 
 def _status_name(executor: Any) -> str:
@@ -342,6 +962,10 @@ class ExecutorService:
         # compares against this and skips the database when nothing changed.
         self._persisted_child_order_ids: Dict[str, tuple] = {}
 
+        # Order ids startup must not cancel: live ids of a resumed range iceberg,
+        # and the exchange stop of one whose resume failed.
+        self._resume_protected_order_ids: set = set()
+
         # Performance snapshot cadence, on the control loop's own clock (monotonic, so a
         # system clock step cannot stall the series or flood it).
         self._last_snapshot_at: float = 0.0
@@ -350,6 +974,15 @@ class ExecutorService:
         # Control loop task
         self._control_loop_task: Optional[asyncio.Task] = None
         self._is_running = False
+
+        # One lock per (account, connector, pair, side) so two creates of a
+        # range iceberg on that slot cannot both pass the open check.
+        # The lock is per process. A single uvicorn worker is assumed.
+        # Another worker has its own dict and would not share this lock.
+        self._range_iceberg_slot_locks: Dict[tuple, asyncio.Lock] = {}
+        # One lock per executor so two config edits cannot interleave.
+        # Per process only. A single uvicorn worker is assumed.
+        self._range_iceberg_edit_locks: Dict[str, asyncio.Lock] = {}
 
     def start(self):
         """Start the executor service control loop."""
@@ -418,19 +1051,40 @@ class ExecutorService:
         Identifies executors marked as RUNNING in the database but not present
         in memory (i.e., from previous API sessions that were terminated).
 
-        Child orders those executors left open are cancelled from the persisted
-        order rows and custom_info before the rows are marked SYSTEM_CLEANUP.
-        Executors are not resumed.
+        Range iceberg executors that graceful shutdown persisted for resume
+        (exit_state ARMED, RESTING, or CLOSING) are started from that saved state
+        before anything else. A resumed executor does not continue an unfinished
+        entry. It resumes exits only, sized to the exchange position. Every
+        exchange stop id stays up. Entry and exit client order ids are cancelled
+        for every executor, resumed ones included.
+
+        Exchange stops on an executor that is not RUNNING and was not parked
+        with resume_on_startup are cancelled here as well, except a POSITION_HOLD
+        row, which kept the position on purpose. A failed resume leaves its
+        exchange stops in place and records the failure on the row. A flat
+        exchange position is not resumed: the row is marked CLOSED_WHILE_DOWN
+        and its exchange stops are cancelled.
         """
         if not self.db_manager:
             logger.debug("No database manager available, skipping orphaned executor cleanup")
             return
 
         try:
-            # Get list of currently active executor IDs in memory
-            active_executor_ids = list(self._active_executors.keys())
+            try:
+                await self._resume_range_iceberg_executors()
+            except Exception as e:
+                logger.error(f"Error resuming range iceberg executors: {e}", exc_info=True)
 
-            await self._cancel_orphaned_child_orders(active_executor_ids)
+            # Resumed executors are in memory. Their software order ids are
+            # still cancelled. Only the exchange stop ids in `protected` stay.
+            active_executor_ids = list(self._active_executors.keys())
+            protected = getattr(self, "_resume_protected_order_ids", None) or set()
+
+            await self._cancel_orphaned_child_orders(
+                active_executor_ids,
+                protected_order_ids=protected,
+            )
+            await self._cancel_finished_exchange_stops(protected)
 
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
@@ -446,6 +1100,9 @@ class ExecutorService:
                 else:
                     logger.debug("No orphaned executors found in database")
 
+            for item in list(getattr(self, "_flat_while_down", None) or []):
+                await self._mark_closed_while_down(item)
+
         except Exception as e:
             logger.error(f"Error cleaning up orphaned executors: {e}", exc_info=True)
 
@@ -453,9 +1110,11 @@ class ExecutorService:
         """Stop the executor service and all active executors.
 
         Each executor still running is asked to early_stop with keep_position, which
-        cancels working orders and does not close a filled position. Shutdown then
-        waits, up to SHUTDOWN_CANCEL_TIMEOUT_SECONDS, until those cancels are
-        confirmed. Connector teardown happens only after this method returns.
+        cancels software entry and exit orders and does not close a filled position.
+        A range iceberg whose exit_state is ARMED, RESTING, or CLOSING is persisted
+        after those cancels are confirmed. Every exchange stop id stays on the
+        exchange. Shutdown waits, up to SHUTDOWN_CANCEL_TIMEOUT_SECONDS, for the
+        software cancels. Connector teardown happens only after this method returns.
         """
         self._is_running = False
 
@@ -469,11 +1128,26 @@ class ExecutorService:
 
         # The API control loop is down, so it cannot persist a completion while a
         # cancel is still unconfirmed. Each executor's own loop keeps running and
-        # is what observes the exchange ack.
+        # is what observes the exchange ack. Resumable range icebergs take the
+        # same early_stop, so entry and exit orders are cancelled, and are persisted
+        # afterwards with the exchange stop still in place.
+        resume_ids: List[str] = []
         for executor_id in list(self._active_executors.keys()):
             executor = self._active_executors.get(executor_id)
             if executor is None or self._executor_is_closed(executor):
                 continue
+            if (
+                self._should_persist_for_resume(executor_id, executor)
+                and not self._shutdown_already_started(executor)
+            ):
+                resume_ids.append(executor_id)
+                info = self._custom_info_for_snapshot(executor)
+                if info is not None:
+                    snapshots = getattr(self, "_shutdown_resume_snapshots", None)
+                    if snapshots is None:
+                        snapshots = {}
+                        self._shutdown_resume_snapshots = snapshots
+                    snapshots[executor_id] = info
             await self._persist_running_child_orders(executor_id, executor)
             if self._shutdown_already_started(executor):
                 # close_type was already chosen. Calling early_stop again would
@@ -491,6 +1165,17 @@ class ExecutorService:
         for executor_id in list(self._active_executors.keys()):
             executor = self._active_executors.get(executor_id)
             if executor is None:
+                continue
+            if executor_id in resume_ids:
+                if executor_id in unconfirmed:
+                    logger.error(
+                        "Software-order cancel was not confirmed for range iceberg %s before "
+                        "shutdown. Startup will cancel leftover entry and exit orders. "
+                        "Left exchange stop %s on the exchange.",
+                        executor_id,
+                        _exchange_stop_text(self._safe_custom_info(executor)),
+                    )
+                await self._persist_range_iceberg_for_resume(executor_id, executor)
                 continue
             if executor_id in unconfirmed:
                 pending = [oid for oid in unconfirmed[executor_id] if oid]
@@ -546,6 +1231,755 @@ class ExecutorService:
             if "keep_position" not in str(exc):
                 raise
             executor.early_stop()
+
+    def _should_persist_for_resume(self, executor_id: str, executor: Any) -> bool:
+        meta = self._executor_metadata.get(executor_id, {})
+        if meta.get("executor_type") != "range_iceberg_executor":
+            return False
+        return _exit_state_name(self._safe_custom_info(executor)) in _RESUMABLE_EXIT_STATES
+
+    def _custom_info_for_snapshot(self, executor: Any) -> Optional[Dict[str, Any]]:
+        getter = getattr(executor, "get_custom_info", None)
+        if not callable(getter):
+            return None
+        try:
+            info = getter()
+        except Exception:
+            logger.error("Could not read custom_info for a resume snapshot", exc_info=True)
+            return None
+        if not isinstance(info, dict):
+            return None
+        return info
+
+    async def _write_final_state(self, executor_id: str, payload: Dict[str, Any]) -> None:
+        if not self.db_manager:
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                stored = _parse_stored_custom_info(record.final_state) if record is not None else {}
+                folded, applied = _fold_reported_config_edit(stored, payload)
+                encoded = json.dumps(folded, default=_json_default)
+                config_json = _config_json_with_applied_edit(record, applied)
+                updated = await repo.update_executor(
+                    executor_id,
+                    final_state=encoded,
+                    config=config_json,
+                )
+            if updated is None:
+                logger.error(
+                    "No executor row to store resume state for %s. Left exchange stop %s on the exchange.",
+                    executor_id,
+                    _exchange_stop_text(payload),
+                )
+        except Exception as exc:
+            logger.error("Could not store resume state for executor %s: %s", executor_id, exc)
+
+    async def _persist_range_iceberg_for_resume(self, executor_id: str, executor: Any) -> None:
+        """Save the pre-cancel snapshot after early_stop, and drop the in-process task.
+
+        early_stop has already been asked to cancel software entry and exit orders.
+        The snapshot is the custom_info from before that call, so exit_state and the
+        software order ids are still present for startup. The exchange stop is not
+        part of that cancel. Completion is not run, so the row stays RUNNING.
+        """
+        snapshots = getattr(self, "_shutdown_resume_snapshots", None) or {}
+        info = snapshots.get(executor_id)
+        if info is None:
+            info = self._custom_info_for_snapshot(executor)
+        state = _exit_state_name(info) if info is not None else None
+        stop_text = _exchange_stop_text(info)
+        if info is None:
+            logger.error(
+                "Could not read custom_info while persisting range iceberg executor %s for resume. "
+                "Left exchange stop %s on the exchange.",
+                executor_id,
+                stop_text,
+            )
+        else:
+            payload = dict(info)
+            payload[_RESUME_ON_STARTUP] = True
+            cache = getattr(self, "_persisted_child_order_ids", None)
+            if isinstance(cache, dict):
+                cache.pop(executor_id, None)
+            await self._persist_running_child_orders(executor_id, executor)
+            await self._write_final_state(executor_id, payload)
+        self._stop_executor_task(executor_id, executor)
+        self._drop_executor_memory(executor_id)
+        logger.info(
+            "Persisted range iceberg executor %s for resume on startup (exit_state=%s). "
+            "Software entry and exit orders were cancelled. Left exchange stop %s on the exchange.",
+            executor_id,
+            state or "unknown",
+            stop_text,
+        )
+
+    async def _load_resume_candidates(self) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            running = await repo.get_active_executors()
+            for record in running:
+                if record.executor_id in self._active_executors:
+                    continue
+                if record.executor_type != "range_iceberg_executor":
+                    continue
+                custom = _parse_stored_custom_info(record.final_state)
+                # A released slot must not come back on restart beside the
+                # executor that took its place. Release itself refuses a
+                # non-terminated row. This is the second check.
+                if custom.get("slot_released") is True:
+                    continue
+                if custom.get(_RESUME_ON_STARTUP) is not True:
+                    continue
+                open_order_ids = []
+                for row in await repo.get_executor_orders(record.executor_id):
+                    oid = row.client_order_id
+                    if not oid or oid in _SKIP_ORDER_IDS:
+                        continue
+                    if (row.status or "").upper() in _TERMINAL_ORDER_STATUSES:
+                        continue
+                    open_order_ids.append(oid)
+                candidates.append({
+                    "executor_id": record.executor_id,
+                    "account_name": record.account_name,
+                    "connector_name": record.connector_name,
+                    "trading_pair": record.trading_pair,
+                    "controller_id": record.controller_id or "main",
+                    "config_json": record.config,
+                    "created_at": record.created_at,
+                    "custom": custom,
+                    "open_order_ids": open_order_ids,
+                })
+        return candidates
+
+    async def _mark_resume_failed(self, item: Dict[str, Any], message: str) -> None:
+        if not self.db_manager:
+            return
+        custom = dict(item.get("custom") or {})
+        stop_text = _exchange_stop_text(custom)
+        custom[_RESUME_FAILED] = True
+        custom[_RESUME_ERROR] = message
+        custom[_RESUME_ON_STARTUP] = False
+        text = (
+            f"Resume failed for range iceberg executor {item['executor_id']}: {message}. "
+            f"Left exchange stop {stop_text} on the exchange."
+        )
+        try:
+            final_state = json.dumps(custom, default=_json_default)
+            error_log = json.dumps([{
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": text,
+                "exc_info": None,
+            }])
+        except Exception:
+            logger.error(
+                "Could not serialize resume failure for %s", item["executor_id"], exc_info=True
+            )
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                await ExecutorRepository(session).update_executor(
+                    item["executor_id"],
+                    final_state=final_state,
+                    error_log=error_log,
+                )
+        except Exception:
+            logger.error(
+                "Could not mark resume failure for %s", item["executor_id"], exc_info=True
+            )
+
+    async def _resume_one_range_iceberg(self, item: Dict[str, Any]) -> List[str]:
+        executor_id = item["executor_id"]
+        custom = item["custom"]
+        if not item.get("config_json"):
+            raise ValueError("saved executor config is missing")
+        try:
+            config = json.loads(item["config_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("saved executor config is not valid JSON") from exc
+        if not isinstance(config, dict):
+            raise ValueError("saved executor config is not an object")
+        config = dict(config)
+        config["type"] = "range_iceberg_executor"
+        config["id"] = executor_id
+        # A resumed executor does not continue an unfinished entry. size_unit
+        # is forced to BASE. A QUOTE total_amount equal to the open base would
+        # be read as quote and place a much larger new entry. resume_entries
+        # false is the same instruction on the config the executor reads.
+        open_base = _reported_decimal(None, custom, "open_base")
+        edited = item.get("_resume_edits")
+        if not isinstance(edited, dict):
+            edited = _resume_edits_in_base(
+                custom,
+                config.get("size_unit"),
+                _resume_entry_average(custom, None),
+                self._contract_size_for_resume(item),
+            )
+        if open_base is not None:
+            # An edit's total_amount, converted into base, wins over the open
+            # base. Without that key, the open base is the size. A reported
+            # quote total is not an edit and must not become the base size.
+            if "total_amount" not in edited:
+                config["total_amount"] = format(open_base, "f")
+            config["size_unit"] = "BASE"
+            config[_RESUME_ENTRIES] = False
+        for key, value in edited.items():
+            config[key] = value
+        config.setdefault("controller_id", item["controller_id"])
+        if item.get("connector_name"):
+            config.setdefault("connector_name", item["connector_name"])
+        if item.get("trading_pair"):
+            config.setdefault("trading_pair", item["trading_pair"])
+
+        account = item.get("account_name") or self.default_account
+        trading = self._get_trading_interface(account)
+        _executor_class, _config_class, typed_config = self._validate_executor_config(
+            config, default_timestamp=getattr(trading, "current_timestamp", None)
+        )
+        await self._prepare_market(account, config.get("connector_name"), config.get("trading_pair"))
+
+        executor = _executor_class(
+            strategy=trading,
+            config=typed_config,
+            update_interval=getattr(self, "update_interval", 1.0),
+            max_retries=getattr(self, "max_retries", 10),
+        )
+        restore = getattr(executor, "restore_from_custom_info", None)
+        if not callable(restore):
+            raise RuntimeError("executor has no restore_from_custom_info")
+        # resume_entries false tells the executor, once it honors the flag, not
+        # to place another entry rung. The trimmed order lists keep restore from
+        # adopting software orders that startup is about to cancel.
+        saved = {key: value for key, value in custom.items() if key not in _API_RESUME_KEYS}
+        saved[_RESUME_ENTRIES] = False
+        result = restore(saved)
+        if asyncio.iscoroutine(result):
+            await result
+
+        created_at = item.get("created_at") or datetime.now(timezone.utc)
+        self._active_executors[executor_id] = executor
+        self._executor_metadata[executor_id] = {
+            "account_name": account,
+            "connector_name": config.get("connector_name"),
+            "trading_pair": config.get("trading_pair"),
+            "executor_type": "range_iceberg_executor",
+            "controller_id": item["controller_id"],
+            "created_at": created_at,
+            "config": config,
+        }
+        try:
+            token = current_executor_id.set(executor_id)
+            try:
+                executor.start()
+            finally:
+                current_executor_id.reset(token)
+        except Exception:
+            self._drop_executor_memory(executor_id)
+            raise
+
+        # The running config is BASE. The column has to say so before the
+        # next restart, or a later base edit is converted as if it were quote.
+        await self._persist_resumed_config(executor_id, config)
+
+        # Every exchange stop is protected. Entry and exit client order ids
+        # are leftover software orders and startup cancels them, including for
+        # this resumed executor.
+        return _exchange_stop_ids(custom)
+
+    async def _persist_resumed_config(self, executor_id: str, config: Dict[str, Any]) -> None:
+        """Store the config the resumed executor is running."""
+        if not getattr(self, "db_manager", None):
+            return
+        try:
+            encoded = json.dumps(config, default=_json_default)
+        except Exception:
+            logger.error(
+                "Could not serialize the resumed config for %s", executor_id, exc_info=True,
+            )
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                updated = await ExecutorRepository(session).update_executor(
+                    executor_id, config=encoded,
+                )
+            if updated is None:
+                logger.error("No executor row to store the resumed config for %s", executor_id)
+        except Exception:
+            logger.error(
+                "Could not store the resumed config for %s", executor_id, exc_info=True,
+            )
+
+    def _saved_side_name(self, item: Dict[str, Any]) -> str:
+        custom = item.get("custom") or {}
+        side = custom.get("side")
+        if side in (None, ""):
+            try:
+                config = json.loads(item.get("config_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                config = {}
+            if isinstance(config, dict):
+                side = config.get("side")
+        if side in (None, ""):
+            return "BUY"
+        name = getattr(side, "name", side)
+        return str(name).strip().upper() or "BUY"
+
+    @staticmethod
+    def _parse_position(
+        position: Any,
+        trading_pair: str,
+        side_name: str,
+    ) -> Optional[tuple]:
+        """One book row against this pair and side.
+
+        ``(base, entry)`` when the row is this pair and side. ``()`` when it
+        is a different pair or side. None when the row is this pair and side
+        but its size cannot be read. A None is not a flat position.
+        """
+        if isinstance(position, dict):
+            pair = position.get("trading_pair")
+            raw_side = position.get("position_side")
+            raw_amount = position.get("amount")
+            raw_entry = position.get("entry_price")
+        else:
+            pair = getattr(position, "trading_pair", None)
+            raw_side = getattr(position, "position_side", None)
+            raw_amount = getattr(position, "amount", None)
+            raw_entry = getattr(position, "entry_price", None)
+        if _normalize_trading_pair(pair) != _normalize_trading_pair(trading_pair):
+            return ()
+        side_text = getattr(raw_side, "name", raw_side)
+        side_text = side_text.strip().upper() if isinstance(side_text, str) else ""
+        want_long = side_name in {"BUY", "LONG"}
+        amount = None
+        amount_ok = False
+        if raw_amount not in (None, ""):
+            try:
+                amount = Decimal(str(raw_amount))
+                amount_ok = True
+            except Exception:
+                amount_ok = False
+        if side_text in {"LONG", "SHORT"}:
+            matches = (side_text == "LONG") == want_long
+        elif not amount_ok:
+            return None
+        elif amount == 0:
+            return ()
+        else:
+            matches = (amount > 0) == want_long
+        if not matches:
+            return ()
+        if not amount_ok:
+            return None
+        try:
+            entry_price = Decimal(str(raw_entry)) if raw_entry not in (None, "") else None
+        except Exception:
+            entry_price = None
+        return abs(amount), entry_price
+
+    async def _exchange_open_base(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        side_name: str,
+    ) -> Optional[tuple]:
+        """Absolute base and entry price on this pair and side.
+
+        None when the connector position book cannot be read, or when a
+        position on this pair and side cannot be parsed. The base is zero
+        when the book was read and that side is flat. The entry price is None
+        when the book has no price. Hedge mode matches LONG to BUY and SHORT
+        to SELL. A signed one-way amount uses its sign the same way.
+        """
+        connector = self._account_connector(account_name, connector_name)
+        if connector is None or not hasattr(connector, "account_positions"):
+            return None
+        updater = getattr(connector, "_update_positions", None)
+        if callable(updater):
+            try:
+                result = updater()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.error(
+                    "Could not refresh positions for %s %s",
+                    connector_name,
+                    trading_pair,
+                    exc_info=True,
+                )
+                return None
+        book = getattr(connector, "account_positions", None)
+        if not isinstance(book, dict):
+            return None
+        total = Decimal("0")
+        entry_base = Decimal("0")
+        entry_notional = Decimal("0")
+        for position in book.values():
+            parsed = self._parse_position(position, trading_pair, side_name)
+            if parsed is None:
+                return None
+            if parsed == ():
+                continue
+            base, entry_price = parsed
+            total += base
+            if entry_price is not None and entry_price > 0 and base > 0:
+                entry_base += base
+                entry_notional += entry_price * base
+        average_entry = entry_notional / entry_base if entry_base > 0 else None
+        return total, average_entry
+
+    async def _mark_closed_while_down(self, item: Dict[str, Any]) -> None:
+        """The exchange position is flat, so this parked executor is not resumed."""
+        if not self.db_manager:
+            return
+        custom = dict(item.get("custom") or {})
+        stop_text = _exchange_stop_text(custom)
+        custom[_RESUME_ON_STARTUP] = False
+        custom["closed_while_down"] = True
+        message = (
+            f"Position for range iceberg executor {item['executor_id']} was flat on the exchange "
+            f"while the API was down. Cancelled exchange stop {stop_text}."
+        )
+        custom[_RESUME_ERROR] = message
+        try:
+            final_state = json.dumps(custom, default=_json_default)
+            error_log = json.dumps([{
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": message,
+                "exc_info": None,
+            }])
+        except Exception:
+            logger.error(
+                "Could not serialize flat-position close for %s", item["executor_id"], exc_info=True
+            )
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                await ExecutorRepository(session).update_executor(
+                    item["executor_id"],
+                    status="TERMINATED",
+                    close_type=_CLOSED_WHILE_DOWN,
+                    final_state=final_state,
+                    error_log=error_log,
+                )
+        except Exception:
+            logger.error(
+                "Could not mark %s closed while the API was down", item["executor_id"], exc_info=True
+            )
+
+    async def _cancel_exchange_stop_now(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        executor_id: str,
+        stop_id: Optional[str],
+        reason: str,
+    ) -> Optional[str]:
+        """Cancel one exchange stop. None when it is confirmed, otherwise the error.
+
+        ``connector.cancel`` does not cancel a MEXC stop id. The stop cancel
+        API is ``cancel_stop_orders``. A response that does not accept the id,
+        or an open-stop query that still lists it, is a failure.
+        """
+        if not stop_id:
+            return None
+        connector = self._account_connector(account_name, connector_name)
+        try:
+            error = await self._cancel_stop_on_connector(connector, trading_pair, stop_id)
+        except Exception as exc:
+            error = str(exc)
+        if error:
+            logger.error(
+                "Failed to cancel exchange stop %s for executor %s on %s %s: %s",
+                stop_id,
+                executor_id,
+                connector_name,
+                trading_pair,
+                error,
+            )
+            return error
+        logger.info(
+            "Cancelled exchange stop %s for executor %s on %s %s because %s",
+            stop_id,
+            executor_id,
+            connector_name,
+            trading_pair,
+            reason,
+        )
+        return None
+
+    async def _cancel_exchange_stops(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        executor_id: str,
+        stop_ids: List[str],
+        reason: str,
+    ) -> Optional[str]:
+        """Cancel every exchange stop. None when each one is confirmed."""
+        errors: List[str] = []
+        for stop_id in stop_ids:
+            error = await self._cancel_exchange_stop_now(
+                account_name,
+                connector_name,
+                trading_pair,
+                executor_id,
+                stop_id,
+                reason,
+            )
+            if error:
+                errors.append(error)
+        if errors:
+            return "; ".join(errors)
+        return None
+
+    async def _park_flat(self, item: Dict[str, Any], reason: str) -> None:
+        """Leave the row RUNNING so software orders are still cancelled, then close it."""
+        flats = getattr(self, "_flat_while_down", None)
+        if flats is None:
+            flats = []
+            self._flat_while_down = flats
+        flats.append(item)
+        stop_ids = _exchange_stop_ids(item.get("custom"))
+        error = await self._cancel_exchange_stops(
+            item.get("account_name") or self.default_account,
+            item.get("connector_name") or "",
+            item.get("trading_pair") or "",
+            item["executor_id"],
+            stop_ids,
+            reason,
+        )
+        if error:
+            custom = item.get("custom")
+            if isinstance(custom, dict):
+                custom["exchange_stop_error"] = error
+        logger.info(
+            "Range iceberg executor %s was not resumed on %s %s. %s Cancelled exchange stop %s.",
+            item["executor_id"],
+            item.get("connector_name"),
+            item.get("trading_pair"),
+            reason,
+            ", ".join(stop_ids) if stop_ids else "none",
+        )
+
+    async def _resume_allocated_positions(
+        self,
+        ready: List[Dict[str, Any]],
+        protected: set,
+        resumed: List[str],
+    ) -> None:
+        """Give each parked executor a share of the one exchange position.
+
+        Executors on the same account, connector, pair, and side share one
+        position. Shares are handed out in created_at order. Each share is at
+        most that executor's saved open base, and the shares sum to at most
+        the exchange position. A later executor that is left with nothing is
+        closed instead of resumed.
+        """
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for item in ready:
+            key = (
+                item.get("account_name") or self.default_account,
+                item.get("connector_name") or "",
+                item.get("trading_pair") or "",
+                item.get("_side_name") or "BUY",
+            )
+            groups.setdefault(key, []).append(item)
+        for key, items in groups.items():
+            items.sort(key=lambda row: (row.get("created_at") is None, row.get("created_at"), row["executor_id"]))
+            actual = items[0].get("_actual") or Decimal("0")
+            if actual == 0:
+                for item in items:
+                    await self._park_flat(item, "the position was flat while the API was down")
+                continue
+            remaining = actual
+            shares: List[str] = []
+            for item in items:
+                saved_open = item.get("_saved_open")
+                if saved_open is None:
+                    share = remaining
+                else:
+                    share = min(saved_open, remaining)
+                if share <= 0:
+                    await self._park_flat(
+                        item,
+                        "no exchange position remained after earlier executors on this side were allocated",
+                    )
+                    shares.append(f"{item['executor_id']}=0")
+                    continue
+                remaining -= share
+                if saved_open is not None and share < saved_open:
+                    logger.info(
+                        "Allocated %s of exchange position %s to range iceberg %s "
+                        "(saved open_base %s) on %s %s. Later executors share what remains.",
+                        share,
+                        actual,
+                        item["executor_id"],
+                        saved_open,
+                        key[2],
+                        key[3],
+                    )
+                elif saved_open is not None and actual > saved_open and len(items) == 1:
+                    logger.warning(
+                        "Exchange position %s is larger than saved open_base %s for range iceberg %s "
+                        "on %s. Another position may share this side. Resuming exits on %s.",
+                        actual,
+                        saved_open,
+                        item["executor_id"],
+                        key[2],
+                        share,
+                    )
+                shares.append(f"{item['executor_id']}={format(share, 'f')}")
+                custom = item["custom"]
+                average = _resume_entry_average(custom, item.get("_entry_price"))
+                size_unit = None
+                try:
+                    saved_config = json.loads(item.get("config_json") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    saved_config = None
+                if isinstance(saved_config, dict):
+                    size_unit = saved_config.get("size_unit")
+                price = average
+                if (price is None or price <= 0) and isinstance(saved_config, dict):
+                    for key in ("limit_price", "price_low"):
+                        candidate = _reported_decimal(None, saved_config, key)
+                        if candidate is not None and candidate > 0:
+                            price = candidate
+                            break
+                edits = _resume_edits_in_base(
+                    custom,
+                    size_unit,
+                    price,
+                    self._contract_size_for_resume(item),
+                )
+                attempt = dict(item)
+                attempt["_resume_edits"] = edits
+                attempt["custom"] = _exit_only_custom_info(custom, share, average, edits)
+                state = item.get("_state")
+                stop_ids = _exchange_stop_ids(custom)
+                try:
+                    live_ids = await self._resume_one_range_iceberg(attempt)
+                except Exception as exc:
+                    await self._mark_resume_failed(item, str(exc))
+                    protected.update(stop_ids)
+                    logger.error(
+                        "Failed to resume range iceberg executor %s (exit_state=%s). "
+                        "Left exchange stop %s on the exchange. %s",
+                        item["executor_id"],
+                        state,
+                        ", ".join(stop_ids) if stop_ids else "none",
+                        exc,
+                    )
+                    continue
+                protected.update(live_ids)
+                self._resumed_executor_ids.add(item["executor_id"])
+                resumed.append(item["executor_id"])
+                logger.info(
+                    "Resumed range iceberg executor %s from saved state (exit_state=%s) "
+                    "before orphan cleanup. Resuming exits only on open_base %s. "
+                    "Protected exchange stop %s. Software order ids stay eligible for cleanup.",
+                    item["executor_id"],
+                    state,
+                    format(share, "f"),
+                    ", ".join(stop_ids) if stop_ids else "none",
+                )
+            if len(items) > 1:
+                logger.info(
+                    "Allocated exchange position %s on %s %s across parked executors: %s. "
+                    "The shares sum to %s, which does not exceed the position.",
+                    actual,
+                    key[2],
+                    key[3],
+                    ", ".join(shares),
+                    format(actual - remaining, "f"),
+                )
+
+    async def _resume_range_iceberg_executors(self) -> None:
+        """Start range icebergs that graceful shutdown saved, before orphan cleanup.
+
+        A resumed executor does not continue an unfinished entry. The restore
+        payload sets resume_entries false and sizes the exit to the reconciled
+        open base. Every exchange stop id is protected from the cleanup that
+        follows. Entry and exit client order ids are cancelled with every
+        other leftover software order.
+        """
+        protected: set = set()
+        self._resume_protected_order_ids = protected
+        self._resumed_executor_ids = set()
+        self._flat_while_down = []
+        if not self.db_manager:
+            return
+        candidates = await self._load_resume_candidates()
+        resumed: List[str] = []
+        ready: List[Dict[str, Any]] = []
+        for item in candidates:
+            executor_id = item["executor_id"]
+            custom = item["custom"]
+            state = _exit_state_name(custom)
+            stop_ids = _exchange_stop_ids(custom)
+            stop_text = ", ".join(stop_ids) if stop_ids else "none"
+            if state not in _RESUMABLE_EXIT_STATES:
+                await self._mark_resume_failed(
+                    item,
+                    f"saved exit_state {state or 'missing'} cannot be resumed",
+                )
+                protected.update(stop_ids)
+                logger.error(
+                    "Failed to resume range iceberg executor %s (exit_state=%s). "
+                    "Left exchange stop %s on the exchange. saved exit_state cannot be resumed",
+                    executor_id,
+                    state or "missing",
+                    stop_text,
+                )
+                continue
+            side_name = self._saved_side_name(item)
+            try:
+                snapshot = await self._exchange_open_base(
+                    item.get("account_name") or self.default_account,
+                    item.get("connector_name") or "",
+                    item.get("trading_pair") or "",
+                    side_name,
+                )
+            except Exception as exc:
+                snapshot = None
+                logger.error(
+                    "Could not read the exchange position for range iceberg %s: %s",
+                    executor_id,
+                    exc,
+                    exc_info=True,
+                )
+            if snapshot is None:
+                await self._mark_resume_failed(
+                    item,
+                    "could not read the exchange position before resume",
+                )
+                protected.update(stop_ids)
+                logger.error(
+                    "Failed to resume range iceberg executor %s (exit_state=%s). "
+                    "Left exchange stop %s on the exchange. could not read the exchange position",
+                    executor_id,
+                    state,
+                    stop_text,
+                )
+                continue
+            actual, entry_price = snapshot
+            item["_saved_open"] = range_iceberg_held_base(None, custom)
+            item["_actual"] = actual
+            item["_entry_price"] = entry_price
+            item["_state"] = state
+            item["_side_name"] = side_name
+            ready.append(item)
+        await self._resume_allocated_positions(ready, protected, resumed)
+        if resumed:
+            logger.info(
+                "Resumed range iceberg executors before orphan cleanup: %s",
+                ", ".join(resumed),
+            )
 
     def _stop_executor_task(self, executor_id: str, executor: Any) -> None:
         try:
@@ -675,6 +2109,33 @@ class ExecutorService:
             return None
         return connectors.get(connector_name)
 
+    def _contract_size_for_resume(self, item: Dict[str, Any]) -> Optional[Decimal]:
+        """Contract size for a CONTRACTS total_amount, in base per contract.
+
+        A connector without ``get_contract_size`` counts one base per contract,
+        matching the executor. A getter that fails leaves the size unknown so
+        the open base is kept instead of the raw contract count.
+        """
+        connector = self._account_connector(
+            item.get("account_name") or getattr(self, "default_account", ""),
+            item.get("connector_name") or "",
+        )
+        if connector is None:
+            return Decimal("1")
+        getter = getattr(connector, "get_contract_size", None)
+        if not callable(getter):
+            return Decimal("1")
+        try:
+            size = Decimal(str(getter(item.get("trading_pair"))))
+        except Exception:
+            logger.error(
+                "Could not read contract size for range iceberg %s",
+                item.get("executor_id"),
+                exc_info=True,
+            )
+            return None
+        return size if size > 0 else None
+
     @staticmethod
     def _safe_custom_info(executor: Any) -> Dict[str, Any]:
         getter = getattr(executor, "get_custom_info", None)
@@ -723,14 +2184,17 @@ class ExecutorService:
         side = info.get("side") or "BUY"
         trade_type = side.name if hasattr(side, "name") else str(side)
         try:
-            final_state_json = json.dumps(info, default=_json_default)
-        except Exception as e:
-            logger.warning(f"Could not serialize custom_info for {executor_id}: {e}")
-            final_state_json = None
-
-        try:
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                stored = _parse_stored_custom_info(record.final_state) if record is not None else {}
+                folded, applied_edit = _fold_reported_config_edit(stored, info)
+                try:
+                    final_state_json = json.dumps(folded, default=_json_default)
+                except Exception as e:
+                    logger.warning(f"Could not serialize custom_info for {executor_id}: {e}")
+                    final_state_json = None
+                applied_config = _config_json_with_applied_edit(record, applied_edit)
                 existing = {
                     row.client_order_id: row
                     for row in await repo.get_executor_orders(executor_id)
@@ -751,39 +2215,49 @@ class ExecutorService:
                 for oid, row in existing.items():
                     if oid not in signature and (row.status or "").upper() not in _TERMINAL_ORDER_STATUSES:
                         await repo.update_executor_order(oid, status="DONE")
-                if final_state_json is not None:
-                    await repo.update_executor(executor_id, final_state=final_state_json)
+                if final_state_json is not None or applied_config is not None:
+                    await repo.update_executor(
+                        executor_id,
+                        final_state=final_state_json,
+                        config=applied_config,
+                    )
             cache[executor_id] = signature
         except Exception as e:
             logger.error(f"Error persisting child orders for executor {executor_id}: {e}")
 
-    async def _cancel_orphaned_child_orders(self, active_executor_ids: List[str]) -> None:
-        """Cancel child orders still open for RUNNING executors that have no owner.
+    async def _cancel_orphaned_child_orders(
+        self,
+        active_executor_ids: List[str],
+        protected_order_ids: Optional[set] = None,
+    ) -> None:
+        """Cancel leftover software orders, including those of a resumed executor.
 
         Order ids come from executor_orders and from the custom_info snapshot stored
-        on the executor row. Filled orders are left alone. Nothing here starts an
-        executor again.
+        on the executor row, including exit_order_ids. Filled orders are left alone.
+        A resumed executor is in active_executor_ids. Its entry and exit client
+        order ids are still cancelled. Every exchange stop id of a resumed
+        executor is in protected_order_ids. A non-resumed exchange stop is
+        cancelled when open_base is 0. A failed resume puts its stops in
+        protected_order_ids so they stay up.
         """
         if not self.db_manager:
             return
 
         active = set(active_executor_ids)
+        resumed_ids = set(getattr(self, "_resumed_executor_ids", None) or ())
+        protected = set(protected_order_ids or ())
         pending: List[Dict[str, Any]] = []
         async with self.db_manager.get_session_context() as session:
             repo = ExecutorRepository(session)
             order_repo = OrderRepository(session)
             running = await repo.get_active_executors()
             for record in running:
-                if record.executor_id in active:
+                # An executor already running in this process keeps its orders.
+                # A resumed range iceberg is in memory too, and its software
+                # orders are still cancelled.
+                if record.executor_id in active and record.executor_id not in resumed_ids:
                     continue
-                custom: Dict[str, Any] = {}
-                if record.final_state:
-                    try:
-                        parsed = json.loads(record.final_state)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed = {}
-                    if isinstance(parsed, dict):
-                        custom = parsed
+                custom = _parse_stored_custom_info(record.final_state)
                 working, filled = child_order_ids_from_custom_info(custom)
                 order_ids = list(working)
                 seen = set(order_ids)
@@ -795,10 +2269,27 @@ class ExecutorService:
                         continue
                     seen.add(oid)
                     order_ids.append(oid)
-                if not order_ids:
+                stop_ids = _exchange_stop_ids(custom)
+                resumed = record.executor_id in resumed_ids
+                cancel_stop = bool(stop_ids) and not resumed and _open_base_is_zero(custom)
+                if stop_ids:
+                    stop_set = set(stop_ids)
+                    order_ids = [oid for oid in order_ids if oid not in stop_set]
+                if protected:
+                    order_ids = [oid for oid in order_ids if oid not in protected]
+                stops_to_cancel = [
+                    stop_id for stop_id in stop_ids
+                    if cancel_stop and stop_id not in protected
+                ]
+                if not order_ids and not stops_to_cancel:
                     continue
                 db_orders = await order_repo.get_orders_by_client_ids(order_ids)
                 db_status = {row.client_order_id: row.status for row in db_orders}
+                exchange_ids = {
+                    row.client_order_id: row.exchange_order_id
+                    for row in db_orders
+                    if row.exchange_order_id
+                }
                 pending.append({
                     "executor_id": record.executor_id,
                     "account_name": record.account_name,
@@ -807,6 +2298,8 @@ class ExecutorService:
                     "order_ids": order_ids,
                     "filled_ids": set(filled),
                     "db_status": db_status,
+                    "exchange_ids": exchange_ids,
+                    "stop_ids": stops_to_cancel,
                 })
 
         for item in pending:
@@ -814,13 +2307,27 @@ class ExecutorService:
             book = getattr(connector, "in_flight_orders", None) if connector is not None else None
             if not isinstance(book, dict):
                 book = {}
+            if item.get("stop_ids"):
+                await self._cancel_exchange_stops(
+                    item["account_name"],
+                    item["connector_name"],
+                    item["trading_pair"],
+                    item["executor_id"],
+                    item["stop_ids"],
+                    "open_base is 0",
+                )
             for order_id in item["order_ids"]:
                 if order_id in item["filled_ids"]:
                     continue
                 if not self._child_order_still_open(order_id, book, item["db_status"].get(order_id)):
                     continue
                 try:
-                    await self._cancel_on_connector(connector, item["trading_pair"], order_id)
+                    outcome = await self._cancel_software_order(
+                        connector,
+                        item["trading_pair"],
+                        order_id,
+                        (item.get("exchange_ids") or {}).get(order_id),
+                    )
                 except Exception as e:
                     logger.error(
                         "Failed to cancel open child order %s for executor %s on %s %s: %s",
@@ -831,6 +2338,15 @@ class ExecutorService:
                         e,
                     )
                     continue
+                if outcome == "already_gone":
+                    logger.info(
+                        "Software order %s for executor %s on %s %s was already gone",
+                        order_id,
+                        item["executor_id"],
+                        item["connector_name"],
+                        item["trading_pair"],
+                    )
+                    continue
                 logger.info(
                     "Cancelled open child order %s for executor %s on %s %s before SYSTEM_CLEANUP",
                     order_id,
@@ -839,12 +2355,290 @@ class ExecutorService:
                     item["trading_pair"],
                 )
 
+    async def _cancel_finished_exchange_stops(self, protected_order_ids: Optional[set] = None) -> None:
+        """Cancel exchange stops left by executors that already ended.
+
+        A row that is not RUNNING and is not marked resume_on_startup no longer
+        owns a protective stop, unless it closed POSITION_HOLD and kept the
+        position on purpose. The hummingbot executor also cancels the stop when
+        the position is flat or the take profit finishes. This pass is the
+        safety net for a user stop or a FAILED close.
+        """
+        if not self.db_manager:
+            return
+        protected = set(protected_order_ids or ())
+        async with self.db_manager.get_session_context() as session:
+            records = await ExecutorRepository(session).get_executors(limit=None)
+            pending = []
+            for record in records:
+                if (record.status or "") == "RUNNING":
+                    continue
+                if (record.close_type or "") == "POSITION_HOLD":
+                    continue
+                custom = _parse_stored_custom_info(record.final_state)
+                if custom.get(_RESUME_ON_STARTUP) is True:
+                    continue
+                if custom.get(_EXCHANGE_STOP_CANCELLED) is True:
+                    continue
+                stop_ids = [
+                    stop_id for stop_id in _exchange_stop_ids(custom)
+                    if stop_id not in protected
+                ]
+                if not stop_ids:
+                    continue
+                pending.append({
+                    "executor_id": record.executor_id,
+                    "account_name": record.account_name,
+                    "connector_name": record.connector_name,
+                    "trading_pair": record.trading_pair,
+                    "stop_ids": stop_ids,
+                    "custom": custom,
+                })
+        for item in pending:
+            error = await self._cancel_exchange_stops(
+                item["account_name"],
+                item["connector_name"],
+                item["trading_pair"],
+                item["executor_id"],
+                item["stop_ids"],
+                "the executor is not RUNNING and was not parked for resume",
+            )
+            custom = dict(item["custom"])
+            custom[_RESUME_ON_STARTUP] = False
+            if error:
+                custom["exchange_stop_error"] = error
+            else:
+                custom[_EXCHANGE_STOP_CANCELLED] = True
+                custom.pop("exchange_stop_error", None)
+            try:
+                encoded = json.dumps(custom, default=_json_default)
+            except Exception:
+                logger.error(
+                    "Could not record exchange stop cancel for %s", item["executor_id"], exc_info=True
+                )
+                continue
+            try:
+                async with self.db_manager.get_session_context() as session:
+                    await ExecutorRepository(session).update_executor(
+                        item["executor_id"], final_state=encoded
+                    )
+            except Exception:
+                logger.error(
+                    "Could not record exchange stop cancel for %s", item["executor_id"], exc_info=True
+                )
+
     @staticmethod
     def _child_order_still_open(order_id: str, book: Dict[str, Any], db_status: Optional[str]) -> bool:
         inflight = book.get(order_id)
         if inflight is not None:
             return _inflight_is_open(inflight)
         return _order_status_is_open(db_status)
+
+    @staticmethod
+    def _software_order_is_tracked(connector: Any, order_id: str) -> bool:
+        book = getattr(connector, "in_flight_orders", None)
+        if isinstance(book, dict) and order_id in book:
+            return True
+        finder = getattr(connector, "_find_order", None)
+        if callable(finder):
+            try:
+                return finder(order_id) is not None
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def _open_row_matches(row: Any, client_order_id: str, exchange_order_id: Optional[str]) -> bool:
+        if isinstance(row, str):
+            return row == client_order_id or (exchange_order_id is not None and row == exchange_order_id)
+        if isinstance(row, dict):
+            client = row.get("externalOid") or row.get("client_order_id") or row.get("clientOrderId")
+            exchange = row.get("orderId") or row.get("exchange_order_id") or row.get("id")
+        else:
+            client = getattr(row, "client_order_id", None) or getattr(row, "externalOid", None)
+            exchange = getattr(row, "exchange_order_id", None) or getattr(row, "orderId", None)
+        if client is not None and str(client) == client_order_id:
+            return True
+        return exchange_order_id is not None and exchange is not None and str(exchange) == str(exchange_order_id)
+
+    async def _open_orders(self, connector: Any, trading_pair: str) -> Optional[list]:
+        """Open orders from the connector, or None when it has no query."""
+        lister = getattr(connector, "list_open_orders", None)
+        if callable(lister):
+            try:
+                result = lister(trading_pair)
+            except TypeError:
+                result = lister()
+        else:
+            lister = getattr(connector, "_open_order_rows", None)
+            if not callable(lister):
+                return None
+            result = lister()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result is None:
+            return []
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            data = result.get("data", result)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("resultList", "list", "orders"):
+                    rows = data.get(key)
+                    if isinstance(rows, list):
+                        return rows
+        return []
+
+    async def _cancel_untracked_software_order(
+        self,
+        connector: Any,
+        trading_pair: str,
+        client_order_id: str,
+        exchange_order_id: Optional[str],
+    ) -> bool:
+        """Cancel an order the fresh tracker does not know.
+
+        ``connector.cancel`` returns without calling the exchange when the
+        order was never tracked by this process. Cancel by exchange order id
+        through ``_place_cancel`` (or ``cancel_order_by_exchange_id``).
+
+        False means the direct call reported that it did not cancel. The
+        caller checks the open-order list before treating that as a rejection:
+        an unknown id that is already gone is not a failed cancel.
+        """
+        placer = getattr(connector, "_place_cancel", None)
+        if callable(placer):
+            target = SimpleNamespace(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+            )
+            result = placer(client_order_id, target)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result is not False
+        named = getattr(connector, "cancel_order_by_exchange_id", None)
+        if callable(named) and exchange_order_id:
+            result = named(exchange_order_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result is not False
+        raise RuntimeError(f"no direct cancel for untracked order {client_order_id}")
+
+    async def _cancel_software_order(
+        self,
+        connector: Any,
+        trading_pair: str,
+        client_order_id: str,
+        exchange_order_id: Optional[str],
+    ) -> Optional[str]:
+        """Cancel one software order and confirm it is no longer open.
+
+        A tracked order uses ``connector.cancel``. An untracked order uses the
+        direct cancel path. When the connector can list open orders, success
+        requires that the id is gone from that list.
+
+        Returns ``already_gone`` when the direct cancel reports that it did
+        not cancel, and the open-order list shows the id is not working.
+        """
+        direct_declined = False
+        tracked = connector is not None and self._software_order_is_tracked(connector, client_order_id)
+        if tracked:
+            await self._cancel_on_connector(connector, trading_pair, client_order_id)
+        else:
+            try:
+                accepted = await self._cancel_untracked_software_order(
+                    connector, trading_pair, client_order_id, exchange_order_id
+                )
+            except RuntimeError as exc:
+                if not str(exc).startswith("no direct cancel"):
+                    raise
+                # No direct path on this connector. The plain cancel is the
+                # only call it exposes. An open-order query below rejects it
+                # when that call left the order working.
+                await self._cancel_on_connector(connector, trading_pair, client_order_id)
+            else:
+                direct_declined = not accepted
+        open_rows = await self._open_orders(connector, trading_pair)
+        if open_rows is None:
+            if direct_declined:
+                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
+            return None
+        still_open = any(
+            self._open_row_matches(row, client_order_id, exchange_order_id) for row in open_rows
+        )
+        if still_open:
+            if direct_declined:
+                raise RuntimeError(f"direct cancel of {client_order_id} was rejected")
+            raise RuntimeError(f"order {client_order_id} is still open after cancel")
+        if direct_declined:
+            return "already_gone"
+        return None
+
+    @staticmethod
+    def _stop_cancel_error(result: Any, stop_id: str) -> Optional[str]:
+        """None when the stop-cancel response accepted the id."""
+        if result is None:
+            return f"cancel_stop_orders returned nothing for {stop_id}"
+        data: Any = result
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                detail = result.get("message") or result.get("msg") or result
+                return f"cancel_stop_orders rejected {stop_id}: {detail}"
+            code = result.get("code")
+            if code not in (None, 0, "0"):
+                return f"cancel_stop_orders code {code} for {stop_id}"
+            data = result.get("data", [])
+        rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("errorCode", row.get("error_code", 0))
+            try:
+                code = int(raw or 0)
+            except (TypeError, ValueError):
+                code = 1
+            if code != 0:
+                detail = row.get("errorMsg") or row
+                return f"cancel_stop_orders error {code} for {stop_id}: {detail}"
+        return None
+
+    async def _cancel_stop_on_connector(
+        self,
+        connector: Any,
+        trading_pair: str,
+        stop_id: str,
+    ) -> Optional[str]:
+        """None when the exchange accepted the stop cancel and the id is gone."""
+        if connector is None:
+            return f"connector is not loaded; cannot cancel stop {stop_id}"
+        canceller = getattr(connector, "cancel_stop_orders", None)
+        if not callable(canceller):
+            return f"connector has no cancel_stop_orders; cannot cancel stop {stop_id}"
+        try:
+            result = canceller([stop_id])
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as exc:
+            return str(exc)
+        error = self._stop_cancel_error(result, stop_id)
+        if error:
+            return error
+        lister = getattr(connector, "list_open_stop_orders", None)
+        if not callable(lister):
+            return None
+        try:
+            listed = lister(trading_pair)
+            if asyncio.iscoroutine(listed):
+                listed = await listed
+        except Exception as exc:
+            return f"could not confirm stop {stop_id} was cancelled: {exc}"
+        rows = listed if isinstance(listed, list) else []
+        if any(self._open_row_matches(row, stop_id, stop_id) for row in rows):
+            return f"stop {stop_id} is still open after cancel_stop_orders"
+        return None
 
     @staticmethod
     async def _cancel_on_connector(connector: Any, trading_pair: str, order_id: str) -> None:
@@ -1327,6 +3121,11 @@ class ExecutorService:
         if "timestamp" not in executor_config or executor_config["timestamp"] is None:
             executor_config["timestamp"] = default_timestamp
 
+        # The whole dict is passed to the config model. Range iceberg fields
+        # (protective_exchange_stop, stop_loss_fallback_seconds,
+        # allow_adverse_take_profit, protective_stop_buffer_pct,
+        # exchange_stop_trigger_price) reach the executor once that model
+        # declares them. This method does not keep a field whitelist.
         executor_class, config_class = self.EXECUTOR_REGISTRY[executor_type]
         try:
             typed_config = config_class(**executor_config)
@@ -1393,6 +3192,440 @@ class ExecutorService:
 
         return executor_id, executor
 
+    def _range_iceberg_edit_lock(self, executor_id: str) -> asyncio.Lock:
+        """The lock for edits of one range iceberg.
+
+        Per process only. A single uvicorn worker is assumed.
+        """
+        locks = getattr(self, "_range_iceberg_edit_locks", None)
+        if locks is None:
+            locks = {}
+            self._range_iceberg_edit_locks = locks
+        lock = locks.get(executor_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[executor_id] = lock
+        return lock
+
+    def _range_iceberg_slot_lock(self, slot: tuple) -> asyncio.Lock:
+        """The lock for one account, connector, pair, and side.
+
+        Per process only. A single uvicorn worker is assumed.
+        """
+        locks = getattr(self, "_range_iceberg_slot_locks", None)
+        if locks is None:
+            locks = {}
+            self._range_iceberg_slot_locks = locks
+        lock = locks.get(slot)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[slot] = lock
+        return lock
+
+    @staticmethod
+    def _range_iceberg_side_of_stored(config_raw: Any, final_state: Any) -> str:
+        """Side of a stored executor. Config wins, then the saved custom_info."""
+        if isinstance(config_raw, str) and config_raw:
+            try:
+                parsed = json.loads(config_raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("side") not in (None, ""):
+                return _range_iceberg_side_name(parsed.get("side"))
+        custom = _parse_stored_custom_info(final_state)
+        if custom.get("side") not in (None, ""):
+            return _range_iceberg_side_name(custom.get("side"))
+        return "BUY"
+
+    def _range_iceberg_memory_occupant(self, slot: tuple) -> Optional[str]:
+        """Id of a live in-memory range iceberg on this slot, if any."""
+        account, connector, pair, side = slot
+        for executor_id, executor in self._active_executors.items():
+            if self._executor_is_closed(executor):
+                continue
+            meta = self._executor_metadata.get(executor_id, {})
+            if meta.get("executor_type") != "range_iceberg_executor":
+                continue
+            if (meta.get("account_name") or "") != account:
+                continue
+            if (meta.get("connector_name") or "") != connector:
+                continue
+            if _normalize_trading_pair(meta.get("trading_pair") or "") != pair:
+                continue
+            config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+            stored_side = config.get("side")
+            if stored_side in (None, ""):
+                stored_side = getattr(getattr(executor, "config", None), "side", None)
+            if stored_side in (None, ""):
+                info = self._safe_custom_info(executor)
+                stored_side = info.get("side")
+            if _range_iceberg_side_name(stored_side) == side:
+                return executor_id
+        return None
+
+    def _executor_id_is_live(self, executor_id: str) -> bool:
+        executor = self._active_executors.get(executor_id)
+        return executor is not None and not self._executor_is_closed(executor)
+
+    async def _range_iceberg_slot_rows(self, slot: tuple) -> List[tuple]:
+        """Stored candidates on this slot.
+
+        Columns are copied before the session closes. A later read of a
+        detached row cannot see status, close_type, config, or final_state.
+        The pair is matched after normalization.
+        """
+        if not getattr(self, "db_manager", None):
+            return []
+        account, connector, pair, side = slot
+        stored: List[tuple] = []
+        async with self.db_manager.get_session_context() as session:
+            records = await ExecutorRepository(session).get_open_executors_for_pair(
+                "range_iceberg_executor", account, connector
+            )
+            for record in records:
+                stored.append((
+                    record.executor_id,
+                    record.status,
+                    record.close_type,
+                    record.trading_pair,
+                    record.config,
+                    record.final_state,
+                ))
+        matched: List[tuple] = []
+        for row in stored:
+            if _normalize_trading_pair(row[3] or "") != pair:
+                continue
+            if self._range_iceberg_side_of_stored(row[4], row[5]) != side:
+                continue
+            matched.append(row)
+        return matched
+
+    async def _exchange_side_is_flat(self, slot: tuple) -> bool:
+        """True only when the position book was read and that side is flat.
+
+        An unreadable book is not flat, and neither is a position on this
+        pair and side whose size cannot be parsed. The slot stays occupied.
+        """
+        account, connector, pair, side = slot
+        snapshot = await self._exchange_open_base(account, connector, pair, side)
+        return snapshot is not None and snapshot[0] == 0
+
+    async def _exchange_stops_are_live(self, slot: tuple, custom_info: Any) -> bool:
+        """True when a stored stop id is still open, or cannot be checked.
+
+        No stored id means there is no live stop. A connector that cannot
+        list stops leaves the stored ids treated as live.
+        """
+        stop_ids = _exchange_stop_ids(custom_info)
+        if not stop_ids:
+            return False
+        account, connector_name, pair, _side = slot
+        connector = self._account_connector(account, connector_name)
+        lister = getattr(connector, "list_open_stop_orders", None) if connector is not None else None
+        if not callable(lister):
+            return True
+        try:
+            try:
+                listed = lister(pair)
+            except TypeError:
+                listed = lister()
+            if asyncio.iscoroutine(listed):
+                listed = await listed
+        except Exception:
+            logger.error(
+                "Could not list open stops for %s %s",
+                connector_name,
+                pair,
+                exc_info=True,
+            )
+            return True
+        rows = listed if isinstance(listed, list) else []
+        for stop_id in stop_ids:
+            if any(self._open_row_matches(row, stop_id, stop_id) for row in rows):
+                return True
+        return False
+
+    async def _stale_range_iceberg_blocks(
+        self,
+        slot: tuple,
+        custom_info: Any,
+        flat: bool,
+    ) -> bool:
+        """A RUNNING row that is not in this process.
+
+        Flat, with no live stop, does not block. An open position, a live
+        stop, or an unreadable book does. ``flat`` is the one position read
+        for this create.
+        """
+        if not flat:
+            return True
+        return await self._exchange_stops_are_live(slot, custom_info)
+
+    def _range_iceberg_conflict(self, slot: tuple, occupant: str) -> HTTPException:
+        account, _connector, pair, side = slot
+        detail = (
+            f"A range iceberg is already open on {pair} {side} for {account} "
+            f"(executor {occupant}). Close it first."
+        )
+        logger.info("%s", detail)
+        return HTTPException(status_code=409, detail=detail)
+
+    async def _assert_range_iceberg_slot_free(self, slot: tuple) -> None:
+        """Reject a second open range iceberg on this account, connector, pair, and side.
+
+        A live executor holds the slot. So does a TERMINATED POSITION_HOLD row
+        that still has base or an exchange stop, until the exchange position
+        on that side is flat or the row is marked slot_released. A RUNNING
+        row that is not in memory holds the slot unless that side is flat and
+        has no live stop. A long and a short are different slots, and so is
+        the same side on another account.
+        """
+        occupant = self._range_iceberg_memory_occupant(slot)
+        if occupant is None:
+            rows = await self._range_iceberg_slot_rows(slot)
+            # One position refresh for this create, shared by every parked row.
+            flat_known = False
+            flat = False
+
+            async def side_is_flat() -> bool:
+                nonlocal flat_known, flat
+                if not flat_known:
+                    snapshot = await self._exchange_side_is_flat(slot)
+                    flat = snapshot
+                    flat_known = True
+                return flat
+
+            for row in rows:
+                executor_id, status, close_type, _pair, _config, final_state = row
+                if self._executor_id_is_live(executor_id):
+                    occupant = executor_id
+                    break
+                custom = _parse_stored_custom_info(final_state)
+                if custom.get("slot_released") is True:
+                    continue
+                if (status or "") != "TERMINATED":
+                    if await self._stale_range_iceberg_blocks(slot, custom, await side_is_flat()):
+                        occupant = executor_id
+                        break
+                    continue
+                if close_type != "POSITION_HOLD":
+                    continue
+                if not _stored_position_hold_keeps_slot(custom):
+                    continue
+                if await side_is_flat():
+                    continue
+                occupant = executor_id
+                break
+        if occupant is None:
+            return
+        raise self._range_iceberg_conflict(slot, occupant)
+
+    async def release_range_iceberg_slot(
+        self,
+        account_name: str,
+        connector_name: str,
+        trading_pair: str,
+        side: str,
+        executor_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Mark a TERMINATED POSITION_HOLD range iceberg released.
+
+        Does not close the position or cancel its exchange stop. A new
+        same-side executor then runs on the software stop loss only. Its
+        exchange stop is refused until the parked stop is gone. A row that
+        has not terminated is refused, because it can resume on restart.
+        """
+        pair = _normalize_trading_pair(trading_pair)
+        side_name = _range_iceberg_side_name(side)
+        slot = (account_name, connector_name or "", pair, side_name)
+        async with self._range_iceberg_slot_lock(slot):
+            rows = await self._range_iceberg_slot_rows(slot)
+            if executor_id:
+                rows = [row for row in rows if row[0] == executor_id]
+            target = None
+            refused_id = None
+            for row in rows:
+                row_id, status, close_type, _pair, _config, final_state = row
+                custom = _parse_stored_custom_info(final_state)
+                if custom.get("slot_released") is True:
+                    continue
+                still_open = self._executor_id_is_live(row_id) or (status or "") != "TERMINATED"
+                if still_open or close_type != "POSITION_HOLD":
+                    if still_open:
+                        if executor_id:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=self._resume_on_restart_detail(row_id),
+                            )
+                        if refused_id is None:
+                            refused_id = row_id
+                    continue
+                target = row
+                break
+            if target is None:
+                if refused_id is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=self._resume_on_restart_detail(refused_id),
+                    )
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"No parked range iceberg on {pair} {side_name} "
+                        f"for {account_name}."
+                    ),
+                )
+            row_id = target[0]
+            custom = dict(_parse_stored_custom_info(target[5]))
+            custom["slot_released"] = True
+            if not getattr(self, "db_manager", None):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {row_id} not found",
+                )
+            async with self.db_manager.get_session_context() as session:
+                updated = await ExecutorRepository(session).update_executor(
+                    row_id,
+                    final_state=json.dumps(custom),
+                )
+            if updated is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {row_id} not found",
+                )
+        return {
+            "executor_id": row_id,
+            "released": True,
+            "trading_pair": pair,
+            "side": side_name,
+            "account_name": account_name,
+            "position_closed": False,
+            "exchange_stop_cancelled": False,
+            "warning": _RELEASE_LEAVES_THE_POSITION,
+        }
+
+    @staticmethod
+    def _resume_on_restart_detail(executor_id: str) -> str:
+        return (
+            f"This range iceberg will resume on restart (executor {executor_id}). "
+            "Stop it first."
+        )
+
+    async def update_range_iceberg_config(
+        self,
+        executor_id: str,
+        changes: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply an in-place edit to a live range iceberg.
+
+        Only an executor that is in memory is edited. A parked database row
+        is left alone. An accepted edit is written onto the saved config so
+        a restart resumes the edited values.
+        """
+        if not isinstance(changes, dict):
+            raise HTTPException(status_code=400, detail="changes must be an object")
+        async with self._range_iceberg_edit_lock(executor_id):
+            executor = self._active_executors.get(executor_id)
+            if executor is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {executor_id} not found",
+                )
+            metadata = self._executor_metadata.get(executor_id, {})
+            kind = metadata.get("executor_type")
+            if kind in (None, ""):
+                kind = getattr(getattr(executor, "config", None), "type", None)
+            if kind != "range_iceberg_executor":
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Executor {executor_id} is not a range iceberg",
+                )
+            editor = getattr(executor, "update_config", None)
+            if not callable(editor):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": "the executor cannot apply a config edit",
+                        "executor_id": executor_id,
+                    },
+                )
+            try:
+                result = editor(changes)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception as exc:
+                logger.error("Range iceberg edit failed for %s: %s", executor_id, exc)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": str(exc),
+                        "executor_id": executor_id,
+                    },
+                )
+            if not isinstance(result, dict):
+                result = {}
+            accepted = bool(result.get("accepted"))
+            reason = "" if result.get("reason") in (None, "") else str(result.get("reason"))
+            if not accepted:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "accepted": False,
+                        "reason": reason,
+                        "executor_id": executor_id,
+                    },
+                )
+            if changes:
+                await self._persist_range_iceberg_edit(executor_id, changes)
+        return {
+            "accepted": True,
+            "reason": reason,
+            "executor_id": executor_id,
+        }
+
+    async def _persist_range_iceberg_edit(
+        self,
+        executor_id: str,
+        changes: Dict[str, Any],
+    ) -> None:
+        """Store an accepted edit as pending config_edits.
+
+        The saved config is the config the executor is still running. It is
+        updated only after the executor reports the edit applied. The pending
+        object is what a restart reads, in the executor's own size unit.
+        """
+        stored = {key: _json_edit_value(value) for key, value in changes.items()}
+        if not getattr(self, "db_manager", None):
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                record = await repo.get_executor_by_id(executor_id)
+                if record is None:
+                    logger.error("No executor row to store the edit for %s", executor_id)
+                    return
+                final = _parse_stored_custom_info(record.final_state)
+                edits = final.get("config_edits")
+                if not isinstance(edits, dict):
+                    edits = {}
+                edits.update(stored)
+                final["config_edits"] = edits
+                final["pending_config_edit"] = True
+                final.pop("config_edit_error", None)
+                final.pop("config_edit_note", None)
+                await repo.update_executor(
+                    executor_id,
+                    final_state=json.dumps(final, default=_json_default),
+                )
+        except Exception as exc:
+            logger.error(
+                "Could not persist range iceberg edit for %s: %s",
+                executor_id,
+                exc,
+            )
+
     async def create_executor(
         self,
         executor_config: Dict[str, Any],
@@ -1408,6 +3641,12 @@ class ExecutorService:
 
         Returns:
             Dictionary with executor_id and initial status
+
+        Raises:
+            HTTPException: 409 when a range iceberg is already open on the same
+            account, connector, trading pair, and side. The detail names that
+            executor. A parked POSITION_HOLD still holds the slot until the
+            exchange position is flat or the slot is released.
         """
         account = account_name or self.default_account
         trading_interface = self._get_trading_interface(account)
@@ -1434,10 +3673,34 @@ class ExecutorService:
             "created_at": datetime.now(timezone.utc),
             "config": executor_config
         }
-        executor_id, executor = self._instantiate_and_register(executor_class, typed_config, trading_interface, metadata)
+        slot = None
+        if executor_type == "range_iceberg_executor":
+            side_value = getattr(typed_config, "side", None)
+            if side_value in (None, ""):
+                side_value = executor_config.get("side")
+            slot = (
+                account,
+                connector_name or "",
+                _normalize_trading_pair(trading_pair),
+                _range_iceberg_side_name(side_value),
+            )
 
-        # Persist to database
-        await self._persist_executor_created(executor_id, executor)
+        async def _register_and_persist():
+            created_id, created = self._instantiate_and_register(
+                executor_class, typed_config, trading_interface, metadata
+            )
+            await self._persist_executor_created(created_id, created)
+            return created_id, created
+
+        if slot is None:
+            executor_id, executor = await _register_and_persist()
+        else:
+            # The lock covers the open check and the register, so a second
+            # create on this slot waits until the first is in memory and stored.
+            # The lock is per process (single uvicorn worker).
+            async with self._range_iceberg_slot_lock(slot):
+                await self._assert_range_iceberg_slot_free(slot)
+                executor_id, executor = await _register_and_persist()
 
         # Capture created_at before potential cleanup
         created_at = metadata["created_at"].isoformat()
@@ -1613,6 +3876,21 @@ class ExecutorService:
             db_record = await self.get_executor(executor_id)
             if db_record:
                 custom_info = db_record.get("custom_info") or {}
+                stop_ids = _exchange_stop_ids(custom_info)
+                if (
+                    stop_ids
+                    and db_record.get("status") != "RUNNING"
+                    and custom_info.get(_RESUME_ON_STARTUP) is not True
+                    and db_record.get("close_type") != "POSITION_HOLD"
+                ):
+                    await self._cancel_exchange_stops(
+                        db_record.get("account_name") or getattr(self, "default_account", "") or "",
+                        db_record.get("connector_name") or "",
+                        db_record.get("trading_pair") or "",
+                        executor_id,
+                        stop_ids,
+                        "the executor is not RUNNING and was not parked for resume",
+                    )
                 logger.info(
                     f"Stop requested for already-terminated executor {executor_id} "
                     f"(db status: {db_record.get('status')}, close_type: {db_record.get('close_type')}) - no-op"
@@ -1631,12 +3909,28 @@ class ExecutorService:
         if executor.is_closed:
             raise HTTPException(status_code=400, detail=f"Executor {executor_id} is already closed")
 
-        # Trigger early stop
+        # Trigger early stop. early_stop cancels software orders and leaves the
+        # exchange stop in place for both keep_position values. A stop that does
+        # not keep the position has to drop that exchange stop too. The executor
+        # cancels it when the position goes flat. This is the safety net.
         try:
             executor.early_stop(keep_position=keep_position)
         except Exception as e:
             logger.error(f"Error stopping executor {executor_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Error stopping executor: {str(e)}")
+
+        if not keep_position:
+            metadata = self._executor_metadata.get(executor_id, {})
+            stop_ids = _exchange_stop_ids(self._safe_custom_info(executor))
+            if stop_ids:
+                await self._cancel_exchange_stops(
+                    metadata.get("account_name") or getattr(self, "default_account", "") or "",
+                    metadata.get("connector_name") or "",
+                    metadata.get("trading_pair") or "",
+                    executor_id,
+                    stop_ids,
+                    "stop was requested without keep_position",
+                )
 
         logger.info(f"Initiated stop for executor {executor_id} (keep_position={keep_position})")
 
@@ -1781,8 +4075,22 @@ class ExecutorService:
         metadata = self._executor_metadata.get(executor_id, {})
 
         # Check if this is a POSITION_HOLD close type (keep_position=True)
-        if executor.close_type == CloseType.POSITION_HOLD:
+        close_name = getattr(getattr(executor, "close_type", None), "name", None)
+        if executor.close_type == CloseType.POSITION_HOLD or close_name == "POSITION_HOLD":
             await self._aggregate_position_hold(executor_id, executor, metadata)
+        else:
+            # FAILED and a user stop without keep_position leave the exchange
+            # stop up. Cancel it here, and again on the next startup if this misses.
+            stop_ids = _exchange_stop_ids(self._safe_custom_info(executor))
+            if stop_ids:
+                await self._cancel_exchange_stops(
+                    metadata.get("account_name") or getattr(self, "default_account", "") or "",
+                    metadata.get("connector_name") or "",
+                    metadata.get("trading_pair") or "",
+                    executor_id,
+                    stop_ids,
+                    "the executor ended without keep_position",
+                )
 
         # Persist final state to database
         await self._persist_executor_completed(executor_id, executor)
@@ -1876,6 +4184,8 @@ class ExecutorService:
         # Add log capture info
         result["error_count"] = self._log_capture.get_error_count(executor_id)
         result["last_error"] = self._log_capture.get_last_error(executor_id)
+        result.update(_resume_search_fields(result.get("custom_info")))
+        result.update(_config_edit_response_fields(result.get("custom_info")))
 
         return result
 
@@ -1929,6 +4239,12 @@ class ExecutorService:
             ) if record.final_state else None,
             "error_count": error_count,
             "last_error": last_error,
+            **_resume_search_fields(
+                json.loads(record.final_state) if record.final_state else None
+            ),
+            **_config_edit_response_fields(
+                json.loads(record.final_state) if record.final_state else None
+            ),
         }
 
     def get_summary(self) -> Dict[str, Any]:
@@ -2136,10 +4452,32 @@ class ExecutorService:
             logger.error(f"Error persisting executor creation: {e}")
 
     async def _persist_executor_completed(self, executor_id: str, executor: ExecutorBase):
-        """Persist executor completion to database."""
+        """Persist executor completion to database.
+
+        A failed write is logged and tried once more. Without that retry a
+        finished executor stays RUNNING and holds its slot.
+        """
         if not self.db_manager:
             return
+        for attempt in (1, 2):
+            try:
+                await self._persist_executor_completed_once(executor_id, executor)
+                return
+            except Exception as error:
+                logger.error(
+                    "Error persisting executor completion for %s (attempt %s of 2): %s",
+                    executor_id,
+                    attempt,
+                    error,
+                )
+        logger.error(
+            "Completion write for executor %s failed after one retry. "
+            "The row may still be RUNNING.",
+            executor_id,
+        )
 
+    async def _persist_executor_completed_once(self, executor_id: str, executor: ExecutorBase):
+        """One attempt to write the completion row."""
         try:
             # Read status/close_type directly from executor (most reliable)
             status_name = executor.status.name
@@ -2288,6 +4626,9 @@ class ExecutorService:
                     f"Could not persist completion for executor {executor_id}: no row to "
                     f"update and the repair insert did not take"
                 )
+                raise RuntimeError(
+                    f"completion row for executor {executor_id} was not written"
+                )
             elif repaired:
                 logger.warning(
                     f"Executor {executor_id} completed before its creation row existed; "
@@ -2296,8 +4637,8 @@ class ExecutorService:
             else:
                 logger.debug(f"Persisted executor {executor_id} completion to database")
 
-        except Exception as e:
-            logger.error(f"Error persisting executor completion: {e}")
+        except Exception:
+            raise
 
     # ========================================
     # Position Hold Tracking Methods
@@ -2363,17 +4704,32 @@ class ExecutorService:
             # Extract filled amounts - try different sources
             filled_amount_base = Decimal("0")
             filled_amount_quote = Decimal("0")
+            executor_type = metadata.get("executor_type")
+            # Range iceberg reports open_base / filled_base / closed_base. A zero
+            # open_base is a real empty position and must not fall through to
+            # filled_amount_base, which these executors leave at 0.
+            used_iceberg_base = False
+            if executor_type == "range_iceberg_executor":
+                held_base = range_iceberg_held_base(executor, custom_info)
+                if held_base is not None:
+                    filled_amount_base = held_base
+                    used_iceberg_base = True
 
             # Try from executor attributes directly
-            if hasattr(executor, 'filled_amount_base'):
+            if used_iceberg_base:
+                # Quote follows the open base, not the full entry quote.
+                held_quote = range_iceberg_held_quote(executor, custom_info, filled_amount_base)
+                filled_amount_quote = held_quote if held_quote is not None else Decimal("0")
+
+            if not used_iceberg_base and hasattr(executor, 'filled_amount_base'):
                 filled_amount_base = Decimal(str(executor.filled_amount_base or 0))
-            if hasattr(executor, 'filled_amount_quote'):
+            if not used_iceberg_base and hasattr(executor, 'filled_amount_quote'):
                 filled_amount_quote = Decimal(str(executor.filled_amount_quote or 0))
 
             # Fallback to custom_info
-            if filled_amount_base == 0 and custom_info:
+            if not used_iceberg_base and filled_amount_base == 0 and custom_info:
                 filled_amount_base = Decimal(str(custom_info.get("filled_amount_base", 0)))
-            if filled_amount_quote == 0 and custom_info:
+            if not used_iceberg_base and filled_amount_quote == 0 and custom_info:
                 filled_amount_quote = Decimal(str(custom_info.get("filled_amount_quote", 0)))
 
             # Check for held_position_orders (used by grid_executor, position_executor, etc.)
