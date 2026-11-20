@@ -10,6 +10,30 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
+def drawdown_quote_from_equity(balance):
+    """Stop one AIOT controller after it has lost 20 percent of the quote balance."""
+    if balance is None:
+        return None
+    try:
+        equity = Decimal(str(balance))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if equity <= 0:
+        return None
+    return equity * Decimal("0.20")
+
+
+def _quote_balance(connector, trading_pair: str):
+    getter = getattr(connector, "get_available_balance", None)
+    if not callable(getter):
+        return None
+    quote = str(trading_pair).split("-")[-1]
+    try:
+        return getter(quote)
+    except Exception:
+        return None
+
+
 class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     max_global_drawdown_quote: Optional[float] = None
@@ -46,6 +70,7 @@ class V2WithControllers(StrategyV2Base):
             self.send_performance_report()
 
     def control_max_drawdown(self):
+        self._apply_aiot_drawdown()
         if self.config.max_controller_drawdown_quote:
             self.check_max_controller_drawdown()
         if self.config.max_global_drawdown_quote:
@@ -55,7 +80,10 @@ class V2WithControllers(StrategyV2Base):
         for controller_id, controller in self.controllers.items():
             if controller.status != RunnableStatus.RUNNING:
                 continue
-            controller_pnl = self.get_performance_report(controller_id).global_pnl_quote
+            report = self.get_performance_report(controller_id)
+            if report is None:
+                continue
+            controller_pnl = report.global_pnl_quote
             last_max_pnl = self.max_pnl_by_controller[controller_id]
             if controller_pnl > last_max_pnl:
                 self.max_pnl_by_controller[controller_id] = controller_pnl
@@ -63,6 +91,11 @@ class V2WithControllers(StrategyV2Base):
                 current_drawdown = last_max_pnl - controller_pnl
                 if current_drawdown > self.config.max_controller_drawdown_quote:
                     self.logger().info(f"Controller {controller_id} reached max drawdown. Stopping the controller.")
+                    close = getattr(controller, "protective_close_action", None)
+                    if callable(close):
+                        action = close()
+                        if action is not None:
+                            self.executor_orchestrator.execute_actions([action])
                     controller.stop()
                     executors_order_placed = self.filter_executors(
                         executors=self.get_executors_by_controller(controller_id),
@@ -148,19 +181,82 @@ class V2WithControllers(StrategyV2Base):
 
     def apply_initial_setting(self):
         connectors_position_mode = {}
+        leverage_jobs = []
+        aiot = False
         for controller_id, controller in self.controllers.items():
             self.max_pnl_by_controller[controller_id] = Decimal("0")
             config_dict = controller.config.model_dump()
-            if "connector_name" in config_dict:
-                if self.is_perpetual(config_dict["connector_name"]):
-                    if "position_mode" in config_dict:
-                        connectors_position_mode[config_dict["connector_name"]] = config_dict["position_mode"]
-                    if "leverage" in config_dict and "trading_pair" in config_dict:
-                        self.connectors[config_dict["connector_name"]].set_leverage(
-                            leverage=config_dict["leverage"],
-                            trading_pair=config_dict["trading_pair"])
+            if config_dict.get("controller_name") == "aiot_research":
+                aiot = True
+            name = config_dict.get("connector_name")
+            if name is None or not self.is_perpetual(name):
+                continue
+            if "position_mode" in config_dict:
+                connectors_position_mode[name] = config_dict["position_mode"]
+            if "leverage" in config_dict and "trading_pair" in config_dict:
+                leverage_jobs.append((name, config_dict))
         for connector_name, position_mode in connectors_position_mode.items():
             self.connectors[connector_name].set_position_mode(position_mode)
+        for name, config_dict in leverage_jobs:
+            self._apply_leverage(name, config_dict)
+        if aiot:
+            self._apply_aiot_drawdown()
+
+    def _apply_leverage(self, connector_name: str, config_dict: dict) -> None:
+        connector = self.connectors[connector_name]
+        pair = config_dict["trading_pair"]
+        leverage = int(config_dict["leverage"])
+        if config_dict.get("controller_name") != "aiot_research":
+            connector.set_leverage(leverage=leverage, trading_pair=pair)
+            return
+        confirm = getattr(connector, "confirm_leverage_and_margin", None)
+        if not callable(confirm):
+            self.logger().error(
+                "AIOT did not set leverage. The connector has no confirm_leverage_and_margin."
+            )
+            return
+        from hummingbot.core.data_type.common import PositionSide
+        from hummingbot.core.utils.async_utils import safe_ensure_future
+
+        # Isolated and LONG so a 2019 rejection can match a live read. A side-less
+        # set_leverage does not send openType and is refused in hedge mode.
+        safe_ensure_future(confirm(pair, leverage, "ISOLATED", PositionSide.LONG))
+
+    def _apply_aiot_drawdown(self) -> None:
+        if self.config.max_controller_drawdown_quote is not None:
+            return
+        connector = None
+        pair = "AIOT-USDT"
+        found = False
+        for controller in self.controllers.values():
+            dumped = controller.config.model_dump()
+            if dumped.get("controller_name") != "aiot_research":
+                continue
+            found = True
+            connector = self.connectors.get(dumped.get("connector_name"))
+            pair = dumped.get("trading_pair") or pair
+            break
+        if not found:
+            return
+        quote = drawdown_quote_from_equity(_quote_balance(connector, pair))
+        if quote is None:
+            loaded = connector is None or getattr(connector, "ready", False)
+            if not loaded:
+                return
+            if not getattr(self, "_aiot_balance_warned", False):
+                self._aiot_balance_warned = True
+                self.logger().warning(
+                    "AIOT entries stay off. The quote balance could not be read."
+                )
+            for controller in self.controllers.values():
+                dumped = controller.config.model_dump()
+                if dumped.get("controller_name") != "aiot_research":
+                    continue
+                refuse = getattr(controller, "refuse_entries", None)
+                if callable(refuse):
+                    refuse()
+            return
+        self.config.max_controller_drawdown_quote = float(quote)
 
     def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
         """
