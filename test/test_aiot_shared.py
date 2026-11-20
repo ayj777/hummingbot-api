@@ -76,7 +76,7 @@ def _long(amount):
     )
 
 
-def _bot(strategy="fin_b", quote="2500", connector=None, log=None):
+def _bot(strategy="fin_b", quote="2200", connector=None, log=None):
     from bots.controllers.directional_trading.aiot_engine import Sleeve, f3_l20_strategy
 
     if connector is None:
@@ -150,9 +150,9 @@ def test_shared_configs_are_live_slices_and_leave_the_paper_configs_alone():
     fin = yaml.safe_load((ROOT / "bots/conf/controllers/aiot_fin_b_shared.yml").read_text())
     f3 = yaml.safe_load((ROOT / "bots/conf/controllers/aiot_f3l20_shared.yml").read_text())
     assert fin["strategy"] == "fin_b"
-    assert fin["total_amount_quote"] == 2500
+    assert fin["total_amount_quote"] == 2200
     assert f3["strategy"] == "f3l20"
-    assert f3["total_amount_quote"] == 1500
+    assert f3["total_amount_quote"] == 1650
     for payload in (fin, f3):
         assert payload["controller_name"] == "aiot_shared"
         assert payload["connector_name"] == "mexc_perpetual"
@@ -175,7 +175,7 @@ def test_the_shared_module_resolves_its_own_classes():
     cls = fs_util.load_controller_config_class("directional_trading", "aiot_shared")
     # The loader reloads the module, so the class object is not the one imported above.
     assert cls.__name__ == "AiotSharedConfig"
-    config = cls(id="t", strategy="f3l20", total_amount_quote=Decimal("1500"))
+    config = cls(id="t", strategy="f3l20", total_amount_quote=Decimal("1650"))
     controller_cls = config.get_controller_class()
     assert controller_cls.__name__ == "AiotSharedController"
     controller = controller_cls(config, MagicMock(), MagicMock())
@@ -221,7 +221,7 @@ def test_one_bot_exits_its_share_and_the_other_keeps_its_stop():
     bot_a = _bot(connector=book, log=log)
     bot_b = _bot(connector=book, log=_Log())
     bot_b.config = AiotSharedConfig(
-        id="bot-b", strategy="fin_b", connector_name="mexc_perpetual", total_amount_quote=Decimal("2500")
+        id="bot-b", strategy="fin_b", connector_name="mexc_perpetual", total_amount_quote=Decimal("2200")
     )
     for bot, base, stop_id in ((bot_a, 100, "stop-a"), (bot_b, 80, "stop-b")):
         sleeve = bot._sleeves[0]
@@ -404,25 +404,25 @@ def test_max_size_uses_this_bots_ceiling_and_the_available_balance():
         get_available_balance=balance,
         trading_rules={"AIOT-USDT": _Rule()},
     )
-    fin = _bot(strategy="fin_b", quote="2500", connector=connector)
+    fin = _bot(strategy="fin_b", quote="2200", connector=connector)
     actions, keep = fin._buy_actions(Intent("core", "market_buy", 1.0, 15000.0, "entry", 1, None, float(PRICE)))
     assert keep is False
     quote = actions[0].executor_config.amount * PRICE
-    assert quote <= Decimal("2500")
-    assert quote > Decimal("2490")
-    f3 = _bot(strategy="f3l20", quote="1500", connector=connector)
+    assert quote <= Decimal("2200")
+    assert quote > Decimal("2190")
+    f3 = _bot(strategy="f3l20", quote="1650", connector=connector)
     first, _keep = f3._buy_actions(Intent("core", "market_buy", 1.0, 1500.0, "entry", 1, None, float(PRICE)))
     cash["value"] = Decimal("1000")
     second, _keep = f3._buy_actions(Intent("core", "market_buy", 1.0, 1500.0, "add", 2, -1, float(PRICE)))
     second_quote = second[0].executor_config.amount * PRICE
-    assert first[0].executor_config.amount * PRICE > Decimal("1490")
+    assert first[0].executor_config.amount * PRICE > Decimal("1640")
     assert Decimal("900") < second_quote < Decimal("950")
     assert second[0].executor_config.position_action is PositionAction.OPEN
 
 
 def test_f3_l20_leg_two_updates_the_average_stop_and_replaces_only_that_stop():
     book = _Book([{"id": "s1"}])
-    bot = _bot(strategy="f3l20", quote="1500", connector=book)
+    bot = _bot(strategy="f3l20", quote="1650", connector=book)
     sleeve = bot._sleeves[0]
     sleeve.apply_buy_fill(100.0, 15.0, 1500.0, 1, "entry", 0)
     assert sleeve.stop_price == pytest.approx(90.0)

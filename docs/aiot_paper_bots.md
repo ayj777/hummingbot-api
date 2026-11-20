@@ -153,11 +153,11 @@ MEXC does allow several partial stop plans on one long. Two limits still apply. 
 
 | Config | Strategy | Order size | What it does |
 | --- | --- | --- | --- |
-| `aiot_fin_b_shared` | `fin_b` | 2500 USDT | The same fin_b rules as the paper bot, on this bot's share only |
-| `aiot_f3l20_shared` | `f3l20` | 1500 USDT per leg | F3 entry, one add at RSI14 <= 20, up to 3000 USDT |
+| `aiot_fin_b_shared` | `fin_b` | 2200 USDT | The same fin_b rules as the paper bot, on this bot's share only |
+| `aiot_f3l20_shared` | `f3l20` | 1650 USDT per leg | F3 entry, one add at RSI14 <= 20, up to 3300 USDT |
 
 F3-L20 buys one `total_amount_quote` on a 15m close with RSI14 <= 28 and EMA50 > EMA200. While that leg is open, one later 15m close with RSI14 <= 20 buys the same amount again and does not re-check the trend. The bot sells its whole share at the next open after RSI14 >= 70, at a stop 10 percent under the average fill (the exchange stop is replaced after the second leg), or 24 hours after the first fill.
 
-The two configs together can hold 5500 USDT (2500 plus two legs of 1500). Deploy them like the paper bots, with connector `mexc_perpetual`, leverage 1, position mode HEDGE, and one config per bot.
+The two configs together can hold 5500 USDT (2200 plus two legs of 1650). Deploy them like the paper bots, with connector `mexc_perpetual`, leverage 1, position mode HEDGE, and one config per bot.
 
 The live fin_b bot on `aiot_research` sizes its stop and its exits to the whole exchange long. Stop that bot and flatten its long before starting `aiot_fin_b_shared`, and do that before starting F3-L20. `aiot_shared` will not take over the open long. Leaving the old controller running will close or stop the other bot's share.
