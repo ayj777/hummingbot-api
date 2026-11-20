@@ -796,6 +796,8 @@ def test_the_share_check_runs_again_after_the_first_success():
     assert bot.confirm_share() is True
     bot._live_long = Decimal("100")
     assert bot.confirm_share() is False
+    assert bot._share_halt is None
+    assert bot.confirm_share() is False
     assert "halted" in bot._share_halt
 
 
@@ -1005,6 +1007,27 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
     await asyncio.sleep(0)
     assert bot._share_halt
     assert ("cancel", ["stop-a"]) in book.calls
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_is_saved_before_the_sell(tmp_path):
+    book = _Book([])
+    bot = _bot(connector=book)
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"}}
+    bot._stop_cancel_requested = True
+    await bot._run_stop(book, "cancel", 0, None)
+    saved = json.loads(bot._state_path.read_text(encoding="utf-8"))
+    assert saved.get("stop") == {}
+    assert bot._stop == {}
+    assert bot._stop_cancel_requested is False
+    sold, keep = bot._intent_actions(Intent("core", "market_sell", 100.0, 100.0, "cross", 1))
+    assert keep is False
+    assert sold[0].executor_config.amount == Decimal("100.00000000")
+    assert sold[0].executor_config.position_action is PositionAction.CLOSE
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():

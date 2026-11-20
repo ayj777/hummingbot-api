@@ -554,6 +554,8 @@ class AiotSharedController(research.AiotResearchController):
             return False
         verdict, net, reason = reconcile_share(self._own_orders, rows)
         if verdict != "ok":
+            if self._history_is_lagging(reason):
+                return False
             self._halt(reason)
             return False
         stop_id = (self._stop or {}).get("id")
@@ -576,8 +578,24 @@ class AiotSharedController(research.AiotResearchController):
                 f"AIOT shared share {self._own_base()} does not match its own fills {net}. " "Entries and exits are halted."
             )
             return False
+        self._mismatch_seen = False
         self._mark_share_checked()
         self._save_state()
+        return True
+
+    def _history_is_lagging(self, reason: str) -> bool:
+        """A recheck may see a dealVol that has not caught the ledger yet.
+
+        The first read after a successful check waits. The next one still
+        behind is a real mismatch and halts.
+        """
+        if "fill history says" not in (reason or ""):
+            return False
+        if not getattr(self, "_checked_at", None):
+            return False
+        if getattr(self, "_mismatch_seen", False):
+            return False
+        self._mismatch_seen = True
         return True
 
     def _unknown_client_id(self, rows):
@@ -1263,6 +1281,8 @@ class AiotSharedController(research.AiotResearchController):
                     await research._cancel_stop(connector, stop_id)
                 self._drop_unfilled_stop(stop_id)
                 self._stop = {}
+                self._stop_cancel_requested = False
+                self._save_state()
                 return
             position_id = research.long_position_id(connector, self.config.trading_pair)
             if position_id is None:
