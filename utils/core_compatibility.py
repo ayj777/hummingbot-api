@@ -1,7 +1,7 @@
 """Refuse to start against a hummingbot core that predates what this API reads.
 
 ``environment.yml`` pins ``hummingbot`` to ayj777/hummingbot commit
-``b4380ed1e6c978798baece3ea1a687efb6ced2f7`` (PR #11 on master). Those changes
+``b437a01c87b4579b0a6e4c163a7d31c70a3c9a87`` (PR #13 on master). Those changes
 are not in a PyPI release yet. An image built from an older core comes up
 without the fields this API reads.
 
