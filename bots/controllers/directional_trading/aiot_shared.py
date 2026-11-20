@@ -77,8 +77,13 @@ def parse_fill_row(row, contract_size=Decimal("1")):
 
 def _stop_fill_executed(row) -> bool:
     state = row.get("state", row.get("status"))
-    if state in (1, "1", "untriggered", 2, "2", "cancelled", "canceled"):
+    if state in (2, "2", "cancelled", "canceled"):
         return False
+    if state in (1, "1", "untriggered"):
+        # triggerSide 2 is a stop-loss trigger. realityVol is the contracts filled.
+        triggered = row.get("triggerSide") in (2, "2")
+        filled = row.get("realityVol") not in (None, "", 0, "0", "0.0")
+        return triggered and filled
     if state in (3, "3", "executed", "filled", "finished"):
         return True
     finished = row.get("isFinished", row.get("is_finished"))
@@ -108,7 +113,7 @@ def parse_stop_fill(row, contract_size=Decimal("1")):
         if row.get(key) not in (None, ""):
             plan = str(row[key])
             break
-    if plan is None and row.get("stopLossPrice") not in (None, ""):
+    if plan is None and (row.get("state") not in (None, "") or row.get("stopLossPrice") not in (None, "")):
         plan = _stop_row_id(row)
     try:
         step = Decimal(str(row.get("_contract_size", contract_size)))
@@ -943,8 +948,39 @@ class AiotSharedController(research.AiotResearchController):
             return
         self._share_halt = reason
         self.logger().error(reason)
-        if not getattr(self, "_loading_state", False):
-            self._save_state()
+        if getattr(self, "_loading_state", False):
+            return
+        # Place or keep a reduce-only stop before this returns, so a halt
+        # does not leave the remaining long bare.
+        self._protect_remainder()
+        self._save_state()
+
+    def _protect_remainder(self) -> None:
+        if self._stop_inflight or getattr(self, "_protecting", False):
+            return
+        live = self._live_long
+        own = self._own_base()
+        if live is None or live <= 0 or own <= 0:
+            return
+        cap = min(own, live)
+        state = self._stop or {}
+        if state.get("id") and shares_match(state.get("amount") or 0, cap):
+            return
+        connector = self._connector()
+        if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
+            return
+        price = self._hard_stop_price() or state.get("price")
+        if not price:
+            return
+        self._protecting = True
+        self._stop_inflight = True
+        safe_ensure_future(self._finish_protect(connector, cap, price))
+
+    async def _finish_protect(self, connector, cap, price) -> None:
+        try:
+            await self._run_stop(connector, "place", cap, price)
+        finally:
+            self._protecting = False
 
     def _apply_live_position(self) -> None:
         connector = self._connector()
@@ -962,8 +998,6 @@ class AiotSharedController(research.AiotResearchController):
             own = self._own_base()
             if own > mapped and not self._history_inflight:
                 self._halt(self._residual_reason())
-                # A plan larger than the long can still close the other bot's residual.
-                self._request_stop_cancel()
             elif own > 0 and not self._share_halt:
                 self._upgrade_fallback_stop()
             return
@@ -1074,30 +1108,18 @@ class AiotSharedController(research.AiotResearchController):
             return
         if getattr(self, "_stop_cancel_requested", False):
             return
+        plans = await self._stop_plan_rows(connector)
+        if self._book_exchange_stop_fill(str(current), plans):
+            return
         history = self._history_rows(connector)
-        if history is not None and str(current) in self._our_plan_ids():
-            booked = False
-            for row in history:
-                parsed = parse_stop_fill(row)
-                if parsed is not None and parsed[0] == str(current) and parsed[1] > 0:
-                    booked = True
-                    break
-            if booked and self._apply_history(history):
-                self._stop_missing = 0
-                self._stop = {}
-                self._save_state()
-                return
+        if history is not None and self._book_exchange_stop_fill(str(current), history):
+            return
         self._stop_missing += 1
         if self._stop_missing < 2:
             return
         self.logger().error(f"AIOT shared stop {current} is no longer open. Another bot's plan was not adopted.")
-        tracked = _decimal_or_none((self._stop or {}).get("amount")) or Decimal("0")
-        own = self._own_base()
-        live = self._live_long
-        if tracked > 0 and own > 0 and live is not None and live < own:
-            self._book_local_stop_fill(str(current), min(tracked, own))
-            return
         if self._own_base() > 0:
+            self._stop = {}
             self._halt(
                 f"AIOT shared stop {current} is gone and its fill could not be attributed. " "Entries and exits are halted."
             )
@@ -1195,33 +1217,78 @@ class AiotSharedController(research.AiotResearchController):
             return None
         return list(rows or [])
 
-    def _book_local_stop_fill(self, plan: str, base: Decimal) -> None:
-        price = _decimal_or_none((self._stop or {}).get("price")) or Decimal("0")
-        self._own_orders[f"stop:{plan}"] = {
+    async def _stop_plan_rows(self, connector):
+        """Finished stop plans from GET /api/v1/private/stoporder/list/orders.
+
+        `id` is the plan, `state` 3 is executed, `realityVol` is the contracts
+        that filled. `triggerSide` 2 is a stop-loss trigger.
+        """
+        getter = getattr(connector, "list_stop_orders", None)
+        try:
+            if callable(getter):
+                rows = getter(self.config.trading_pair)
+                if hasattr(rows, "__await__"):
+                    rows = await rows
+                return _stop_rows(rows) or []
+            api = getattr(connector, "_api_get", None)
+            symbol = getattr(connector, "exchange_symbol_associated_to_pair", None)
+            if not callable(api) or not callable(symbol):
+                return []
+            pair = symbol(self.config.trading_pair)
+            if hasattr(pair, "__await__"):
+                pair = await pair
+            response = await api(
+                path_url="/api/v1/private/stoporder/list/orders",
+                params={"symbol": pair, "is_finished": 1, "page_num": 1, "page_size": 100},
+                is_auth_required=True,
+            )
+        except Exception as exc:
+            self.logger().warning(f"AIOT shared could not list stop plans: {exc}")
+            return []
+        data = response.get("data") if isinstance(response, dict) else response
+        if isinstance(data, dict):
+            data = data.get("resultList") or data.get("orders") or data.get("list")
+        return data if isinstance(data, list) else []
+
+    def _book_exchange_stop_fill(self, plan_id, rows) -> bool:
+        """Book this plan's executed contracts. Other plans in the list are ignored."""
+        size = self._contract_size(self._connector())
+        parsed = None
+        for row in rows or []:
+            found = parse_stop_fill(row, size)
+            if found is not None and found[0] == str(plan_id) and found[1] > 0:
+                parsed = found
+                break
+        if parsed is None:
+            return False
+        plan, base, price = parsed
+        key = f"stop:{plan}"
+        current = self._own_orders.get(key) or {}
+        if shares_match(current.get("base") or 0, base):
+            self._stop = {}
+            self._stop_missing = 0
+            return True
+        used = price if price is not None else _decimal_or_none((self._stop or {}).get("price"))
+        self._own_orders[key] = {
             "side": "sell",
-            "level": "shared:stop:sell",
+            "level": current.get("level") or "shared:stop:sell",
             "plan_id": plan,
             "base": _amount_text(base),
-            "price": _amount_text(price),
+            "price": _amount_text(used or 0),
         }
+        if len(self._sleeves) == 1:
+            sleeve = self._sleeves[0]
+            fill_price = float(used or sleeve.stop_price or 0.0)
+            if sleeve.base > 0 and Decimal(str(sleeve.base)) <= base + _SHARE_TOLERANCE:
+                sleeve.exit_reason = "stop"
+                sleeve.apply_sell_fill(fill_price, int(self._now()), -1)
+            elif sleeve.base > 0:
+                sleeve.apply_partial_sell(fill_price, float(base), int(self._now()), -1)
         self._stop = {}
         self._stop_missing = 0
         self._stop_cancel_requested = False
-        left = base
-        for sleeve in self._sleeves:
-            if left <= 0 or sleeve.base <= 0:
-                continue
-            sell = min(float(left), sleeve.base)
-            sleeve.exit_reason = "stop"
-            if sell >= sleeve.base - 1e-12:
-                sleeve.apply_sell_fill(float(price), int(self._now()), -1)
-            else:
-                sleeve.apply_partial_sell(float(price), sell, int(self._now()), -1)
-            left -= Decimal(str(sell))
-        self.logger().warning(
-            "AIOT shared exchange stop is gone. This bot booked that plan as its own sell " "and did not send another close."
-        )
         self._save_state()
+        return True
 
     def _drop_unfilled_stop(self, stop_id) -> None:
         if not stop_id:

@@ -955,8 +955,116 @@ def test_history_and_the_executor_do_not_double_the_share():
     assert bot._own_orders["cid-a"]["base"] == "40.00000000"
 
 
+def _plans():
+    """MEXC stoporder list rows. realityVol is contracts. state 3 is executed."""
+    return [
+        {
+            "id": "stop-a",
+            "state": 3,
+            "triggerSide": 2,
+            "realityVol": "10",
+            "vol": "10",
+            "stopLossPrice": "0.07",
+            "isFinished": 1,
+        },
+        {
+            "id": "stop-b",
+            "state": 3,
+            "triggerSide": 2,
+            "realityVol": "8",
+            "vol": "8",
+            "stopLossPrice": "0.05",
+            "isFinished": 1,
+        },
+    ]
+
+
+def _armed(bot, base, stop_id, price):
+    sleeve = bot._sleeves[0]
+    sleeve.base = float(base)
+    sleeve.phase = "open"
+    sleeve.stop_price = price
+    bot._own_orders = {"cid-" + stop_id: {"side": "buy", "base": f"{base}.00000000", "price": "0.1", "level": "shared:core:buy"}}
+    bot._stop = {"id": stop_id, "amount": f"{base}.00000000", "price": f"{price:.8f}"}
+    bot._live_long = Decimal("180")
+
+
 @pytest.mark.asyncio
-async def test_a_missing_plan_is_booked_as_this_bots_sell_when_the_long_shrinks():
+async def test_one_stop_fill_books_only_that_plans_volume():
+    book = _Book([{"id": "stop-b", "stopLossPrice": "0.05", "base": "80"}])
+    book.get_contract_size = lambda _pair: Decimal("10")
+
+    async def list_stop_orders(_pair):
+        rows = _plans()
+        rows[1] = {"id": "stop-b", "state": 1, "triggerSide": 0, "realityVol": "0", "vol": "8", "stopLossPrice": "0.05"}
+        return rows
+
+    book.list_stop_orders = list_stop_orders
+    bot_a = _bot(connector=book)
+    bot_b = _bot(connector=book)
+    bot_b.config = AiotSharedConfig(
+        id="bot-b", strategy="fin_b", connector_name="mexc_perpetual", total_amount_quote=Decimal("2200")
+    )
+    _armed(bot_a, 100, "stop-a", 0.07)
+    _armed(bot_b, 80, "stop-b", 0.05)
+    await bot_a._sync_stops(book)
+    await bot_b._sync_stops(book)
+    assert bot_a._share_halt is None
+    assert bot_a._sleeves[0].base == 0.0
+    assert bot_a._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert "stop:stop-b" not in bot_a._own_orders
+    assert bot_b._share_halt is None
+    assert bot_b._sleeves[0].base == 80.0
+    assert bot_b._stop["id"] == "stop-b"
+    assert not any(call[0] == "cancel" and call[1] == ["stop-b"] for call in book.calls)
+
+
+@pytest.mark.asyncio
+async def test_both_stop_fills_are_booked_from_each_plan():
+    book = _Book([])
+    book.get_contract_size = lambda _pair: Decimal("10")
+
+    async def _async_plans(_pair):
+        return _plans()
+
+    book.list_stop_orders = _async_plans
+    bot_a = _bot(connector=book)
+    bot_b = _bot(connector=book)
+    _armed(bot_a, 100, "stop-a", 0.07)
+    _armed(bot_b, 80, "stop-b", 0.05)
+    await bot_a._sync_stops(book)
+    await bot_b._sync_stops(book)
+    assert bot_a._sleeves[0].base == 0.0
+    assert bot_a._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert "stop:stop-b" not in bot_a._own_orders
+    assert bot_b._sleeves[0].base == 0.0
+    assert bot_b._own_orders["stop:stop-b"]["base"] == "80.00000000"
+    assert "stop:stop-a" not in bot_b._own_orders
+    assert bot_a._share_halt is None and bot_b._share_halt is None
+
+
+@pytest.mark.asyncio
+async def test_a_close_with_no_triggered_plan_halts_and_does_not_invent_a_fill():
+    book = _Book([])
+
+    async def list_stop_orders(_pair):
+        return [{"id": "stop-a", "state": 2, "triggerSide": 0, "realityVol": "0", "vol": "10", "stopLossPrice": "0.07"}]
+
+    book.list_stop_orders = list_stop_orders
+    bot = _bot(connector=book)
+    _armed(bot, 100, "stop-a", 0.07)
+    bot._live_long = Decimal("0")
+    await bot._sync_stops(book)
+    await bot._sync_stops(book)
+    assert bot._share_halt
+    assert "could not be attributed" in bot._share_halt
+    assert bot._sleeves[0].base == 100.0
+    assert [call for call in book.calls if call[0] == "place"] == []
+    assert bot._state_path.read_text(encoding="utf-8").find(bot._share_halt) > 0
+
+
+@pytest.mark.asyncio
+async def test_a_halt_places_a_stop_on_the_unprotected_remainder():
     book = _Book([])
     bot = _bot(connector=book)
     sleeve = bot._sleeves[0]
@@ -964,16 +1072,16 @@ async def test_a_missing_plan_is_booked_as_this_bots_sell_when_the_long_shrinks(
     sleeve.phase = "open"
     sleeve.stop_price = 0.07
     bot._live_long = Decimal("80")
-    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
-    await bot._sync_stops(book)
-    assert bot._share_halt is None
-    assert bot._stop["id"] == "stop-a"
-    await bot._sync_stops(book)
-    assert bot._share_halt is None
-    assert bot._sleeves[0].base == 0.0
-    assert bot._sleeves[0].phase == "flat"
-    assert bot._own_orders["stop:stop-a"]["base"] == "100.00000000"
-    assert bot._stop == {}
+    bot._positions_seen = True
+    book.account_positions = {"k": _long(80)}
+    bot._apply_live_position()
+    await asyncio.sleep(0)
+    assert bot._share_halt
+    places = [call for call in book.calls if call[0] == "place"]
+    assert places
+    assert places[0][3] == Decimal("80.00000000")
+    assert places[0][5] == 1
+    assert bot._stop["amount"] == "80.00000000"
 
 
 @pytest.mark.asyncio
@@ -1003,10 +1111,14 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
     bot._sleeves[0].base = 100.0
     bot._sleeves[0].phase = "open"
     bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    bot._sleeves[0].stop_price = 0.07
     bot._apply_live_position()
     await asyncio.sleep(0)
     assert bot._share_halt
-    assert ("cancel", ["stop-a"]) in book.calls
+    places = [call for call in book.calls if call[0] == "place"]
+    assert places
+    assert places[0][3] == Decimal("80.00000000")
+    assert bot._stop["amount"] == "80.00000000"
 
 
 @pytest.mark.asyncio
