@@ -1,0 +1,17 @@
+id: aiot_f3l20_shared
+controller_name: aiot_shared
+controller_type: directional_trading
+connector_name: mexc_perpetual
+trading_pair: AIOT-USDT
+candles_connector: mexc
+candles_trading_pair: AIOT-USDT
+# One leg. A second leg can add the same amount, so the bot can hold 3000.
+total_amount_quote: 1500
+leverage: 1
+position_mode: HEDGE
+size_mode: max
+strategy: f3l20
+stop_loss:
+take_profit:
+time_limit:
+trailing_stop:

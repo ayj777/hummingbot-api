@@ -95,6 +95,10 @@ class SleeveSpec:
     rearm: bool = False
     rung_notionals: Tuple[float, ...] = ()
     rung_thresholds: Tuple[float, ...] = ()
+    # One extra buy, once, while the first leg is open. The trend is not checked again.
+    add_rsi: Optional[float] = None
+    # Stop is `stop_pct` under the average buy fill, and it moves after each add.
+    stop_from_average: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +235,39 @@ STRATEGIES = {
         ),
     ),
 }
+
+
+def f3_l20_strategy(notional: float = 1500.0) -> StrategySpec:
+    """F3 entry, plus one add at RSI 20 and a stop under the average fill.
+
+    Leg 1 is F3: a 15m close with RSI14 <= 28 and EMA50 > EMA200 buys one
+    notional at the next open. While that leg is open, one later 15m close
+    with RSI14 <= 20 buys the same notional again. The add does not re-check
+    the trend. The whole position exits at the next open after RSI14 >= 70,
+    at 10 percent under the average fill, or 24 hours after the first fill.
+    """
+    if notional <= 0:
+        raise ValueError("notional must be positive")
+    return StrategySpec(
+        key="f3l20",
+        signal_interval="15m",
+        htf_interval=None,
+        htf_mode=None,
+        total_quote=notional,
+        sleeves=(
+            SleeveSpec(
+                name="core",
+                kind="rsi",
+                notional=notional,
+                rsi_entry=28.0,
+                rsi_exit=70.0,
+                stop_pct=0.10,
+                time_limit_seconds=DAY_SECONDS,
+                add_rsi=20.0,
+                stop_from_average=True,
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -441,6 +478,8 @@ class Sleeve:
         self.exit_reason: Optional[str] = None
         self.pending_saw_regime_off = False
         self.cancel_limit = False
+        self.quote_in = 0.0
+        self.added = False
         self._queued: List[Intent] = []
 
     def drain(self) -> List[Intent]:
@@ -511,6 +550,13 @@ class Sleeve:
             return
         if self.spec.kind == "ladder":
             self._queue_rungs(bar, ctx, index, entry=False)
+            return
+        if self.spec.add_rsi is None or self.added:
+            return
+        if ctx.rsi is None or ctx.rsi > self.spec.add_rsi:
+            return
+        self.added = True
+        self._queue_buy(self.spec.notional, bar.close, "add", index, -1)
 
     def apply_buy_fill(
         self,
@@ -522,15 +568,21 @@ class Sleeve:
         bar_index: int,
     ) -> Fill:
         self.base += base
+        self.quote_in += base * price
         if reason.startswith("rung") and reason[-1].isdigit():
             rung_index = int(reason[-1]) - 1
             if 0 <= rung_index < len(self.rungs):
                 self.rungs[rung_index] = True
+        if reason == "add":
+            self.added = True
         if self.first_fill_price is None:
             self.first_fill_price = price
             self.first_fill_time = time
-            self.stop_price = self._stop_from(price)
+            if not self.spec.stop_from_average:
+                self.stop_price = self._stop_from(price)
             self._arm_limit(base)
+        if self.spec.stop_from_average and self.base > 0.0:
+            self.stop_price = self._stop_from(self.quote_in / self.base)
         self.phase = "open"
         self.exit_reason = None
         return Fill(self.spec.name, "buy", price, base, notional, reason, bar_index, time)
@@ -560,7 +612,9 @@ class Sleeve:
         return self._fill_limit_amount(price, base, time, bar_index)
 
     def abort_buy(self, rung: Optional[int], any_buys_left: bool) -> None:
-        if rung is not None:
+        if rung == -1:
+            self.added = False
+        elif rung is not None:
             self.rungs[rung] = False
         if not any_buys_left and self.base <= 0.0:
             self.phase = "flat"
@@ -588,6 +642,8 @@ class Sleeve:
             "exit_reason": self.exit_reason,
             "pending_saw_regime_off": self.pending_saw_regime_off,
             "rungs": list(self.rungs),
+            "quote_in": self.quote_in,
+            "added": self.added,
         }
 
     def export_state(self) -> dict:
@@ -619,6 +675,8 @@ class Sleeve:
         self.rungs = [bool(flag) for flag in rungs[:3]]
         while len(self.rungs) < 3:
             self.rungs.append(False)
+        self.quote_in = float(state.get("quote_in") or 0.0)
+        self.added = bool(state.get("added"))
 
     def _enter_if_allowed(self, bar: Bar, ctx: Context, index: int) -> None:
         if not self._rearm_allows(ctx.regime_on):
@@ -674,7 +732,9 @@ class Sleeve:
 
     def _queue_buy(self, notional: float, price_ref: float, reason: str, index: int, rung: Optional[int]) -> None:
         if price_ref <= 0.0 or notional <= 0.0:
-            if rung is not None:
+            if rung == -1:
+                self.added = False
+            elif rung is not None:
                 self.rungs[rung] = False
             return
         base = notional / price_ref
@@ -786,6 +846,8 @@ class Sleeve:
         self.bars_held = 0
         self.exit_reason = None
         self.cancel_limit = False
+        self.quote_in = 0.0
+        self.added = False
 
 
 @dataclass

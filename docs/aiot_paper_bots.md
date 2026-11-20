@@ -138,3 +138,26 @@ Entries, stop exits, cross exits, RSI exits, and time exits are market `OrderExe
 8. On the first tick the controller acts on the latest closed signal bar only. It does not replay older bars.
 9. If several close-based exits are true on the same bar, the order is trail, then the regime cross, then RSI, then the time stop. A trail or a stop rearms. A cross, an RSI exit, and a time stop do not.
 10. Reported paper pnl is after simulated fees. The stop trigger itself is on price.
+
+## Shared live bots
+
+`aiot_shared` (`bots/controllers/directional_trading/aiot_shared.py`) is a second controller for the same engine. It is for two or more bots on one MEXC perpetual account and the same AIOT-USDT hedge long. It also runs alone, after the bots move to their own sub-accounts. The paper controller `aiot_research` is unchanged and still assumes it owns the whole long.
+
+Each shared bot tracks only its own base, from fills on its own client order ids. That share is stored in `data/aiot_shared_{config_id}.json` and checked against the bot's order history on startup. If the history is missing or the sizes do not match, the bot halts entries and exits and says why. It does not adopt an existing long, and it does not cancel or replace another bot's orders or stop plans.
+
+Every exit is a reduce-only close of at most the smaller of this bot's base and the current exchange long. If the exchange long is smaller than the share, the order is capped at the long and the cap is logged. The bot's exchange stop is its own partial plan (`volType` 1), sized to its own base at its own stop price. A partial exit cancels and replaces that plan. A full exit cancels only that plan.
+
+MEXC does allow several partial stop plans on one long. Two limits still apply. The new volume plus the volume of stop plans already on the position must be less than the closable quantity, so two plans that add up to the whole long can be rejected. A new plan at the same price does not create a second order: the exchange returns the existing id and updates that plan. This controller will not adopt or cancel that id, and it keeps new entries off until it has a stop of its own.
+
+`size_mode: max` sizes each order to the minimum of that bot's `total_amount_quote`, the available quote times leverage times 0.95, and 98 percent of one MEXC order. Available quote already excludes margin the other bot is using. Entries still wait until 1x isolated is confirmed, and the account must stay HEDGE.
+
+| Config | Strategy | Order size | What it does |
+| --- | --- | --- | --- |
+| `aiot_fin_b_shared` | `fin_b` | 2500 USDT | The same fin_b rules as the paper bot, on this bot's share only |
+| `aiot_f3l20_shared` | `f3l20` | 1500 USDT per leg | F3 entry, one add at RSI14 <= 20, up to 3000 USDT |
+
+F3-L20 buys one `total_amount_quote` on a 15m close with RSI14 <= 28 and EMA50 > EMA200. While that leg is open, one later 15m close with RSI14 <= 20 buys the same amount again and does not re-check the trend. The bot sells its whole share at the next open after RSI14 >= 70, at a stop 10 percent under the average fill (the exchange stop is replaced after the second leg), or 24 hours after the first fill.
+
+The two configs together can hold 5500 USDT (2500 plus two legs of 1500). Deploy them like the paper bots, with connector `mexc_perpetual`, leverage 1, position mode HEDGE, and one config per bot.
+
+The live fin_b bot on `aiot_research` sizes its stop and its exits to the whole exchange long. Stop that bot and flatten its long before starting `aiot_fin_b_shared`, and do that before starting F3-L20. `aiot_shared` will not take over the open long. Leaving the old controller running will close or stop the other bot's share.
