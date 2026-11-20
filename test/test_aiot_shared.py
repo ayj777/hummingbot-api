@@ -1,6 +1,8 @@
 """Two AIOT bots can share one MEXC hedge long, and each keeps its own share."""
 
 import asyncio
+import json
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,10 +119,15 @@ def _bot(strategy="fin_b", quote="2200", connector=None, log=None):
     bot._leverage_next = 0.0
     bot._own_orders = {}
     bot._share_halt = None
+    bot._entry_halt = None
     bot._share_checked = True
+    bot._checked_long = None
+    bot._checked_at = None
     bot._history_inflight = False
+    bot._stop_cancel_requested = False
+    bot._loading_state = False
     bot.executors_info = []
-    bot._state_path = Path("data") / "aiot_shared_bot-a.json"
+    bot._state_path = Path(tempfile.mkdtemp()) / "aiot_shared_bot-a.json"
     bot.market_data_provider = SimpleNamespace(
         connectors={"mexc_perpetual": connector},
         time=lambda: 100.0,
@@ -296,6 +303,10 @@ def test_restart_restores_this_bots_share_and_does_not_take_the_other_long(tmp_p
     }
     saved._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
     saved._save_state()
+    (tmp_path / "aiot_shared_bot-b.json").write_text(
+        json.dumps({"orders": {"cid-other": {"side": "buy", "base": "500.00000000"}}}),
+        encoding="utf-8",
+    )
 
     connector = SimpleNamespace(
         account_positions={"k": _long(600)},
@@ -669,6 +680,197 @@ def test_a_renewed_order_keeps_each_client_id_fill():
     assert bot._sleeves[0].base == pytest.approx(100.0)
     assert bot._own_orders["cid-a"]["base"] == "40.00000000"
     assert bot._own_orders["cid-b"]["base"] == "60.00000000"
+
+
+def _sibling(bot, orders):
+    path = bot._state_path.parent / "aiot_shared_bot-b.json"
+    path.write_text(json.dumps({"orders": orders}), encoding="utf-8")
+
+
+def test_a_stop_plan_fill_is_booked_on_that_bot_and_reloaded(tmp_path):
+    bot = _bot()
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    sleeve = bot._sleeves[0]
+    sleeve.base = 100.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "100.00000000", "price": "0.10000000", "level": "shared:core:buy"}}
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    bot._share_checked = False
+    _sibling(bot, {"cid-other": {"side": "buy", "base": "80.00000000"}})
+    bot.market_data_provider.connectors["mexc_perpetual"] = SimpleNamespace(
+        fill_history=lambda: [
+            {"client_order_id": "cid-a", "base": "100"},
+            {"client_order_id": "cid-other", "base": "80"},
+            {"stopPlanOrderId": "stop-a", "base": "100", "stopLossPrice": "0.07"},
+            {"stopPlanOrderId": "stop-b", "base": "80", "stopLossPrice": "0.05"},
+        ]
+    )
+    assert bot.confirm_share() is True
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == 0.0
+    assert bot._sleeves[0].phase == "flat"
+    assert bot._own_orders["stop:stop-a"]["side"] == "sell"
+    assert bot._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert "cid-other" not in bot._own_orders
+    assert "stop:stop-b" not in bot._own_orders
+    reloaded = _bot()
+    reloaded._state_path = bot._state_path
+    reloaded._load_state()
+    assert reloaded._share_halt is None
+    assert reloaded._sleeves[0].base == 0.0
+    assert reloaded._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert reloaded._stop == {}
+
+
+def test_an_unattributed_fill_halts_and_the_halt_is_reloaded(tmp_path):
+    bot = _bot()
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "100", "price": "0.1", "level": "shared:core:buy"}}
+    bot._share_checked = False
+    bot.market_data_provider.connectors["mexc_perpetual"] = SimpleNamespace(
+        fill_history=lambda: [
+            {"client_order_id": "cid-a", "base": "100"},
+            {"base": "20", "dealVol": "2"},
+        ]
+    )
+    assert bot.confirm_share() is False
+    assert "no client order id" in bot._share_halt
+    assert bot._entries_allowed() is False
+    sold, _keep = bot._intent_actions(Intent("core", "market_sell", 100.0, 1.0, "cross", 1))
+    assert sold == []
+    reloaded = _bot()
+    reloaded._state_path = bot._state_path
+    reloaded._load_state()
+    assert reloaded._share_halt == bot._share_halt
+    assert reloaded._entries_allowed() is False
+
+
+def test_an_unsaved_client_id_halts_and_another_bots_id_does_not(tmp_path):
+    bot = _bot()
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"}}
+    bot._share_checked = False
+    bot.market_data_provider.connectors["mexc_perpetual"] = SimpleNamespace(
+        fill_history=lambda: [
+            {"client_order_id": "cid-a", "base": "100"},
+            {"client_order_id": "cid-missed", "base": "25"},
+        ]
+    )
+    assert bot.confirm_share() is False
+    assert "cid-missed" in bot._share_halt
+    assert "not saved" in bot._share_halt
+
+    other = _bot()
+    other._state_path = tmp_path / "aiot_shared_bot-a2.json"
+    other._sleeves[0].base = 100.0
+    other._sleeves[0].phase = "open"
+    other._own_orders = {"cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"}}
+    other._share_checked = False
+    _sibling(other, {"cid-other": {"side": "buy", "base": "80.00000000"}})
+    other.market_data_provider.connectors["mexc_perpetual"] = SimpleNamespace(
+        fill_history=lambda: [
+            {"client_order_id": "cid-a", "base": "100"},
+            {"client_order_id": "cid-other", "base": "80"},
+        ]
+    )
+    assert other.confirm_share() is True
+    assert other._share_halt is None
+    assert other._sleeves[0].base == pytest.approx(100.0)
+
+
+def test_the_share_check_runs_again_after_the_first_success():
+    box = {"rows": [{"client_order_id": "cid-a", "base": "100"}]}
+    bot = _bot(connector=SimpleNamespace(fill_history=lambda: box["rows"]))
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"}}
+    bot._share_checked = False
+    bot._now = lambda: 100.0
+    assert bot.confirm_share() is True
+    box["rows"] = [{"client_order_id": "cid-a", "base": "40"}]
+    assert bot.confirm_share() is True
+    bot._live_long = Decimal("100")
+    assert bot.confirm_share() is False
+    assert "halted" in bot._share_halt
+
+
+def test_a_same_price_plan_keeps_the_other_bots_volume():
+    tick = Decimal("0.0001")
+    book = _Book([{"id": "stop-b", "stopLossPrice": "0.07000000", "base": "80"}])
+    book.trading_rules = {"AIOT-USDT": SimpleNamespace(min_price_increment=tick)}
+    bot = _bot(connector=book)
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._sleeves[0].stop_price = 0.07
+
+    async def _place():
+        await bot._run_stop(book, "place", Decimal("100"), 0.07)
+
+    asyncio.run(_place())
+    places = [call for call in book.calls if call[0] == "place"]
+    assert len(places) == 1
+    assert places[0][4] == Decimal("0.07010000")
+    assert book.open_stops[0]["base"] == "80"
+    assert bot._stop["id"] == "stop-new-1"
+    assert bot._stop_blocked is None
+    assert not any(call[0] == "cancel" for call in book.calls)
+
+    merged = _Book([{"id": "stop-b", "stopLossPrice": "0.09000000", "base": "80"}])
+    merged.trading_rules = {"AIOT-USDT": SimpleNamespace(min_price_increment=tick)}
+
+    async def place(pair, position_id, amount, stop_loss_price=None, vol_type=None, stop_loss_reverse=None):
+        merged.calls.append(("place", pair, position_id, amount, stop_loss_price, vol_type, stop_loss_reverse))
+        return "stop-b"
+
+    merged.place_position_stop_order = place
+    victim = _bot(connector=merged)
+    victim._sleeves[0].base = 10.0
+    victim._sleeves[0].phase = "open"
+
+    async def _merge():
+        await victim._run_stop(merged, "place", Decimal("10"), 0.09)
+
+    asyncio.run(_merge())
+    assert victim._stop == {}
+    assert victim._stop_blocked
+    assert "same price" in victim._stop_blocked
+    restored = [call for call in merged.calls if call[0] == "place" and call[3] == Decimal("80.00000000")]
+    assert restored
+    assert restored[0][4] == Decimal("0.09000000")
+    assert not any(call[0] == "cancel" for call in merged.calls)
+
+
+def test_a_stop_whose_volume_changed_is_not_left_in_place():
+    book = _Book([{"id": "stop-a", "stopLossPrice": "0.07000000", "base": "40"}])
+    bot = _bot(connector=book)
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._sleeves[0].stop_price = 0.07
+    bot._live_long = Decimal("180")
+    bot._positions_seen = True
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+
+    async def _sync():
+        await bot._sync_stops(book)
+
+    asyncio.run(_sync())
+    assert bot._stop.get("amount") in (None, "")
+    assert bot._stop["id"] == "stop-a"
+    bot._stop_inflight = False
+
+    async def _replace():
+        bot._schedule_stops()
+        await asyncio.sleep(0)
+
+    asyncio.run(_replace())
+    places = [call for call in book.calls if call[0] == "place"]
+    assert places
+    assert places[0][3] == Decimal("100.00000000")
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():
