@@ -950,37 +950,35 @@ class AiotSharedController(research.AiotResearchController):
         self.logger().error(reason)
         if getattr(self, "_loading_state", False):
             return
-        # Place or keep a reduce-only stop before this returns, so a halt
-        # does not leave the remaining long bare.
-        self._protect_remainder()
         self._save_state()
 
-    def _protect_remainder(self) -> None:
-        if self._stop_inflight or getattr(self, "_protecting", False):
-            return
-        live = self._live_long
-        own = self._own_base()
-        if live is None or live <= 0 or own <= 0:
-            return
-        cap = min(own, live)
-        state = self._stop or {}
-        if state.get("id") and shares_match(state.get("amount") or 0, cap):
+    def _read_finished_plan(self) -> None:
+        """Read this plan's executed size before any halt can cover the residual."""
+        if getattr(self, "_attribute_inflight", False) or not (self._stop or {}).get("id"):
             return
         connector = self._connector()
-        if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
+        if connector is None:
             return
-        price = self._hard_stop_price() or state.get("price")
-        if not price:
-            return
-        self._protecting = True
-        self._stop_inflight = True
-        safe_ensure_future(self._finish_protect(connector, cap, price))
+        self._attribute_inflight = True
+        safe_ensure_future(self._attribute_finished_plan(connector))
 
-    async def _finish_protect(self, connector, cap, price) -> None:
+    async def _attribute_finished_plan(self, connector) -> None:
         try:
-            await self._run_stop(connector, "place", cap, price)
+            current = (self._stop or {}).get("id")
+            if not current:
+                return
+            plans = await self._stop_plan_rows(connector)
+            if self._book_exchange_stop_fill(str(current), plans):
+                return
+            rows = await self._open_stop_rows(connector)
+            ids = research.stop_order_ids(rows) if rows is not None else None
+            if ids and str(current) in [str(item) for item in ids]:
+                self._stop_cancel_requested = True
+                await self._run_stop(connector, "cancel", 0, None)
+            if self._own_base() > 0 and self._own_exceeds_long():
+                self._halt(self._residual_reason())
         finally:
-            self._protecting = False
+            self._attribute_inflight = False
 
     def _apply_live_position(self) -> None:
         connector = self._connector()
@@ -997,7 +995,10 @@ class AiotSharedController(research.AiotResearchController):
                 self.confirm_share()
             own = self._own_base()
             if own > mapped and not self._history_inflight:
-                self._halt(self._residual_reason())
+                if (self._stop or {}).get("id"):
+                    self._read_finished_plan()
+                else:
+                    self._halt(self._residual_reason())
             elif own > 0 and not self._share_halt:
                 self._upgrade_fallback_stop()
             return
@@ -1053,7 +1054,10 @@ class AiotSharedController(research.AiotResearchController):
         if self._stop_inflight:
             return
         if self._own_exceeds_long():
-            self._halt(self._residual_reason())
+            if (self._stop or {}).get("id"):
+                self._read_finished_plan()
+            else:
+                self._halt(self._residual_reason())
             return
         live = self._live_long
         price = self._hard_stop_price()
@@ -1287,6 +1291,9 @@ class AiotSharedController(research.AiotResearchController):
         self._stop = {}
         self._stop_missing = 0
         self._stop_cancel_requested = False
+        if self._own_base() <= _SHARE_TOLERANCE and self._share_halt:
+            if "exchange long" in self._share_halt or "could not be attributed" in self._share_halt:
+                self._share_halt = None
         self._save_state()
         return True
 

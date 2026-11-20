@@ -1064,24 +1064,31 @@ async def test_a_close_with_no_triggered_plan_halts_and_does_not_invent_a_fill()
 
 
 @pytest.mark.asyncio
-async def test_a_halt_places_a_stop_on_the_unprotected_remainder():
-    book = _Book([])
-    bot = _bot(connector=book)
-    sleeve = bot._sleeves[0]
-    sleeve.base = 100.0
-    sleeve.phase = "open"
-    sleeve.stop_price = 0.07
-    bot._live_long = Decimal("80")
-    bot._positions_seen = True
+async def test_a_shrink_reads_the_finished_plan_before_covering_the_residual():
+    book = _Book([{"id": "stop-b", "stopLossPrice": "0.05", "base": "80"}])
+    book.get_contract_size = lambda _pair: Decimal("10")
     book.account_positions = {"k": _long(80)}
+    book.fill_history = lambda: [{"client_order_id": "cid-stop-a", "base": "100"}]
+    seen = {"n": 0}
+
+    async def list_stop_orders(_pair):
+        seen["n"] += 1
+        rows = _plans()
+        rows[1] = {"id": "stop-b", "state": 1, "triggerSide": 0, "realityVol": "0", "vol": "8", "stopLossPrice": "0.05"}
+        return rows
+
+    book.list_stop_orders = list_stop_orders
+    bot = _bot(connector=book)
+    _armed(bot, 100, "stop-a", 0.07)
     bot._apply_live_position()
+    bot._schedule_stops()
     await asyncio.sleep(0)
-    assert bot._share_halt
-    places = [call for call in book.calls if call[0] == "place"]
-    assert places
-    assert places[0][3] == Decimal("80.00000000")
-    assert places[0][5] == 1
-    assert bot._stop["amount"] == "80.00000000"
+    assert seen["n"] >= 1
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == 0.0
+    assert bot._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert [call for call in book.calls if call[0] == "place"] == []
+    assert not any(call[0] == "cancel" and call[1] == ["stop-b"] for call in book.calls)
 
 
 @pytest.mark.asyncio
@@ -1115,10 +1122,9 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
     bot._apply_live_position()
     await asyncio.sleep(0)
     assert bot._share_halt
-    places = [call for call in book.calls if call[0] == "place"]
-    assert places
-    assert places[0][3] == Decimal("80.00000000")
-    assert bot._stop["amount"] == "80.00000000"
+    assert bot._sleeves[0].base == 100.0
+    assert [call for call in book.calls if call[0] == "place"] == []
+    assert ("cancel", ["stop-a"]) in book.calls
 
 
 @pytest.mark.asyncio
