@@ -1128,6 +1128,9 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
     assert [call for call in book.calls if call[0] == "place"] == []
     assert ("cancel", ["stop-a"]) in book.calls
     assert bot._stop == {}
+    checks = [line for line in bot._log.errors if "manual check" in line]
+    assert len(checks) == 1
+    assert "100" in checks[0] and "80" in checks[0] and "stop-a" in checks[0]
 
 
 @pytest.mark.asyncio
@@ -1213,8 +1216,10 @@ async def test_finished_stop_list_uses_the_plan_time_and_pages_past_100():
     assert [row["id"] for row in rows if row["id"] == "stop-a"] == ["stop-a"]
     assert len(calls) == 2
     assert calls[0]["start_time"] == 100000
+    assert calls[0]["end_time"] == 100000
     assert calls[0]["page_num"] == 1
     assert calls[1]["page_num"] == 2
+    assert calls[1]["end_time"] == 100000
     assert calls[0]["is_finished"] == 1
 
 
@@ -1264,6 +1269,64 @@ def test_an_old_stop_query_stays_inside_ninety_days():
     for start, end in windows:
         assert end >= start
         assert end - start <= span
+    bot._stop = {"id": "stop-a"}
+    day_ms = 24 * 60 * 60 * 1000
+    end = 200 * day_ms
+    assert bot._stop_windows() == [(end - 7 * day_ms, end)]
+
+
+@pytest.mark.asyncio
+async def test_a_plan_not_bigger_than_the_long_is_kept(tmp_path):
+    book = _Book([{"id": "stop-a"}])
+    book.account_positions = {"k": _long(80)}
+    book.fill_history = lambda: [{"client_order_id": "cid-stop-a", "base": "100"}]
+    bot = _bot(connector=book)
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    (tmp_path / "aiot_shared_bot-b.json").write_text(
+        json.dumps({"sleeves": [{"name": "core", "base": 80}]}),
+        encoding="utf-8",
+    )
+    _armed(bot, 100, "stop-a", 0.07)
+    bot._stop["amount"] = "50.00000000"
+    bot._apply_live_position()
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert bot._share_halt
+    assert bot._entries_allowed() is False
+    assert bot._sleeves[0].base == 100.0
+    assert [call for call in book.calls if call[0] in ("place", "cancel")] == []
+    assert bot._stop["id"] == "stop-a"
+    assert bot._stop["amount"] == "50.00000000"
+    checks = [line for line in bot._log.errors if "manual check" in line]
+    assert len(checks) == 1
+    assert "100" in checks[0] and "80" in checks[0] and "stop-a" in checks[0]
+
+
+@pytest.mark.asyncio
+async def test_a_halt_above_the_book_replaces_this_bots_stop():
+    book = _Book([])
+    book.fill_history = lambda: [
+        {"client_order_id": "cid-a", "base": "100"},
+        {"client_order_id": "cid-missed", "base": "5"},
+    ]
+    bot = _bot(connector=book)
+    bot._live_long = Decimal("180")
+    bot._share_checked = False
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._sleeves[0].stop_price = 0.07
+    bot._own_orders = {
+        "cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"}
+    }
+    assert bot.confirm_share() is False
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert "cid-missed" in bot._share_halt
+    assert bot._entries_allowed() is False
+    places = [call for call in book.calls if call[0] == "place"]
+    assert len(places) == 1
+    assert places[0][3] == Decimal("100.00000000")
+    assert bot._stop["amount"] == "100.00000000"
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():

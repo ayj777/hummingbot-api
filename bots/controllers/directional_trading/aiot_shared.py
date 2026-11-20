@@ -941,13 +941,52 @@ class AiotSharedController(research.AiotResearchController):
         self.logger().error(reason)
         if getattr(self, "_loading_state", False):
             return
-        # The other bot's book is in its own instance directory. A missing,
-        # stale, or unreadable file is not an empty book, so a halt never
-        # places a stop on the long that is left. Cancel this plan when it
-        # is larger than that long.
-        if self._own_exceeds_long():
-            self._request_stop_cancel()
+        self._settle_halt_stop()
         self._save_state()
+
+    def _settle_halt_stop(self) -> None:
+        """A long below this book is unexplained, so do not place a new stop.
+
+        Cancel an open plan only when it is larger than that long. Leave a
+        smaller plan. When the long still covers this book, keep or re-place
+        a stop at this book.
+        """
+        if self._stop_inflight or getattr(self, "_settling_stop", False):
+            return
+        live = self._live_long
+        own = self._own_base()
+        state = self._stop or {}
+        amount = _decimal_or_none(state.get("amount")) or Decimal("0")
+        if live is not None and own > live:
+            plan = "none"
+            if state.get("id"):
+                plan = "id %s amount %s" % (state.get("id"), state.get("amount"))
+            self.logger().error(
+                "AIOT shared needs a manual check. Book %s, exchange long %s, plan %s."
+                % (own, live, plan)
+            )
+            if state.get("id") and amount > live:
+                self._request_stop_cancel()
+            return
+        if live is None or own <= 0 or live < own:
+            return
+        if state.get("id") and shares_match(amount, own):
+            return
+        connector = self._connector()
+        if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
+            return
+        price = self._hard_stop_price() or state.get("price")
+        if not price:
+            return
+        self._settling_stop = True
+        self._stop_inflight = True
+        safe_ensure_future(self._finish_settle_stop(connector, own, price))
+
+    async def _finish_settle_stop(self, connector, own, price) -> None:
+        try:
+            await self._run_stop(connector, "place", own, price)
+        finally:
+            self._settling_stop = False
 
     def _read_finished_plan(self) -> None:
         """Read this plan's executed size before any halt can cover the residual."""
@@ -1239,12 +1278,16 @@ class AiotSharedController(research.AiotResearchController):
             return []
 
     def _stop_windows(self):
-        """Finished-list windows. A start and end cannot span more than 90 days."""
+        """Finished-list windows. A start and end cannot span more than 90 days.
+
+        No saved create time uses the last 7 days, the exchange default.
+        """
+        day_ms = 24 * 60 * 60 * 1000
+        now_ms = int(self._now() * 1000)
         start = (self._stop or {}).get("created")
         if start in (None, ""):
-            return [(None, None)]
+            return [(now_ms - 7 * day_ms, now_ms)]
         span = 89 * 24 * 60 * 60 * 1000
-        now_ms = int(self._now() * 1000)
         start_ms = int(start)
         if now_ms < start_ms:
             now_ms = start_ms
@@ -1262,10 +1305,14 @@ class AiotSharedController(research.AiotResearchController):
         for start_ms, end_ms in self._stop_windows():
             page = 1
             while page <= 20 and pages < 20:
-                params = {"symbol": pair, "is_finished": 1, "page_num": page, "page_size": 100}
-                if start_ms is not None:
-                    params["start_time"] = int(start_ms)
-                    params["end_time"] = int(end_ms)
+                params = {
+                    "symbol": pair,
+                    "is_finished": 1,
+                    "page_num": page,
+                    "page_size": 100,
+                    "start_time": int(start_ms),
+                    "end_time": int(end_ms),
+                }
                 response = await api(
                     path_url="/api/v1/private/stoporder/list/orders",
                     params=params,
