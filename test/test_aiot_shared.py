@@ -215,7 +215,8 @@ def test_parse_fill_row_converts_mexc_contracts_and_ignores_other_ids():
     assert "halted" in reason
 
 
-def test_one_bot_exits_its_share_and_the_other_keeps_its_stop():
+@pytest.mark.asyncio
+async def test_one_bot_exits_its_share_and_the_other_keeps_its_stop():
     book = _Book([{"id": "stop-a"}, {"id": "stop-b"}])
     log = _Log()
     bot_a = _bot(connector=book, log=log)
@@ -230,21 +231,18 @@ def test_one_bot_exits_its_share_and_the_other_keeps_its_stop():
         sleeve.stop_price = 0.07
         bot._live_long = Decimal("180")
         bot._stop = {"id": stop_id, "amount": f"{base}.00000000", "price": "0.07000000"}
+    held, keep = bot_a._intent_actions(Intent("core", "market_sell", 100.0, 100.0, "cross", 1))
+    assert held == []
+    assert keep is True
+    await asyncio.sleep(0)
+    assert ("cancel", ["stop-a"]) in book.calls
+    assert all(call[1] != ["stop-b"] for call in book.calls if call[0] == "cancel")
     actions, keep = bot_a._intent_actions(Intent("core", "market_sell", 100.0, 100.0, "cross", 1))
     assert keep is False
     assert actions[0].executor_config.amount == Decimal("100.00000000")
     assert actions[0].executor_config.position_action is PositionAction.CLOSE
     assert actions[0].executor_config.side is TradeType.SELL
     assert actions[0].executor_config.level_id.startswith("shared:")
-    bot_a._sleeves[0].apply_partial_sell(0.08, 100.0, 1, 1)
-    assert bot_a._sleeves[0].phase == "flat"
-
-    async def _cancel():
-        await bot_a._run_stop(book, "cancel", 0, None)
-
-    asyncio.run(_cancel())
-    assert ("cancel", ["stop-a"]) in book.calls
-    assert all(call[1] != ["stop-b"] for call in book.calls if call[0] == "cancel")
     assert bot_b._stop["id"] == "stop-b"
     assert bot_b._sleeves[0].base == 80.0
     assert bot_b._sleeves[0].phase == "open"
@@ -367,18 +365,26 @@ def test_an_existing_long_is_not_adopted_and_another_stop_is_not_taken():
     assert bot._share_halt is None
 
 
-def test_an_exit_is_capped_at_the_exchange_long():
+def test_an_exit_does_not_take_the_other_bots_residual():
     log = _Log()
     bot = _bot(log=log)
     sleeve = bot._sleeves[0]
     sleeve.base = 100.0
     sleeve.phase = "open"
-    bot._live_long = Decimal("40")
+    bot._live_long = Decimal("80")
     actions, keep = bot._intent_actions(Intent("core", "market_sell", 100.0, 1.0, "cross", 1))
+    assert actions == []
     assert keep is False
-    assert actions[0].executor_config.amount == Decimal("40.00000000")
-    assert actions[0].executor_config.position_action is PositionAction.CLOSE
-    assert any("capped at the exchange long 40" in message for message in log.warnings)
+    assert bot._share_halt
+    assert "was not closed" in bot._share_halt
+    smaller = _bot()
+    smaller._sleeves[0].base = 30.0
+    smaller._sleeves[0].phase = "open"
+    smaller._live_long = Decimal("80")
+    sold, keep = smaller._intent_actions(Intent("core", "market_sell", 30.0, 1.0, "cross", 1))
+    assert keep is False
+    assert sold[0].executor_config.amount == Decimal("30.00000000")
+    assert sold[0].executor_config.position_action is PositionAction.CLOSE
 
 
 def test_reconcile_ignores_another_bots_orders_and_the_research_prefix():
@@ -571,6 +577,98 @@ async def test_restart_reads_mexc_order_history_by_client_id(tmp_path):
     restored._apply_live_position()
     assert restored._live_long == Decimal("600")
     assert restored._sleeves[0].base == 100.0
+
+
+@pytest.mark.asyncio
+async def test_a_matching_stop_is_not_replaced_on_the_shared_long():
+    book = _Book([{"id": "stop-a", "stopLossPrice": "0.07"}])
+    bot = _bot(connector=book)
+    sleeve = bot._sleeves[0]
+    sleeve.base = 100.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07
+    bot._live_long = Decimal("180")
+    bot._positions_seen = True
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    for _ in range(3):
+        bot._stop_inflight = False
+        bot._stop_sync_inflight = False
+        bot._stop_sync_next = 0.0
+        bot._schedule_stops()
+        await asyncio.sleep(0)
+    assert [call for call in book.calls if call[0] in ("cancel", "place")] == []
+    assert bot._stop["id"] == "stop-a"
+    assert bot._share_halt is None
+
+
+def test_a_live_exchange_stop_is_not_joined_by_a_market_stop_sell():
+    book = _Book([{"id": "stop-a"}])
+    bot = _bot(connector=book)
+    sleeve = bot._sleeves[0]
+    sleeve.base = 100.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07
+    bot._live_long = Decimal("180")
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    sleeve.on_price(0.01)
+    assert sleeve.phase == "pending_exit"
+    actions = []
+    for intent in sleeve.drain():
+        built, _keep = bot._intent_actions(intent)
+        actions.extend(built)
+    assert actions == []
+    assert sleeve.phase == "open"
+    assert bot._stop["id"] == "stop-a"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_place_after_cancel_stops_new_entries():
+    book = _Book([{"id": "s1"}])
+
+    async def explode(*_args, **_kwargs):
+        book.calls.append("place")
+        raise RuntimeError("closable")
+
+    book.place_position_stop_order = explode
+    bot = _bot(connector=book)
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._stop = {"id": "s1", "amount": "100.00000000", "price": "0.08000000"}
+    await bot._run_stop(book, "place", Decimal("60"), 0.08)
+    assert bot._stop == {}
+    assert bot._entry_halt
+    assert bot._entries_allowed() is False
+    assert ("cancel", ["s1"]) in book.calls
+
+
+def test_a_renewed_order_keeps_each_client_id_fill():
+    bot = _bot()
+    bot.executors_info = [
+        SimpleNamespace(
+            id="e1",
+            controller_id="bot-a",
+            config=SimpleNamespace(level_id="shared:core:buy", controller_id="bot-a"),
+            custom_info={
+                "executed_amount_base": 100,
+                "average_executed_price": 0.1,
+                "order_id": "cid-b",
+                "held_position_orders": [
+                    {
+                        "client_order_id": "cid-a",
+                        "executed_amount_base": "40",
+                        "executed_amount_quote": "4",
+                    }
+                ],
+            },
+            is_done=True,
+            is_active=False,
+        )
+    ]
+    bot._reconcile()
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == pytest.approx(100.0)
+    assert bot._own_orders["cid-a"]["base"] == "40.00000000"
+    assert bot._own_orders["cid-b"]["base"] == "60.00000000"
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():

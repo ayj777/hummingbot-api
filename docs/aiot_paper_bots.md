@@ -145,7 +145,7 @@ Entries, stop exits, cross exits, RSI exits, and time exits are market `OrderExe
 
 Each shared bot tracks only its own base, from fills on its own client order ids. That share is stored in `data/aiot_shared_{config_id}.json` and checked against the bot's order history on startup. If the history is missing or the sizes do not match, the bot halts entries and exits and says why. It does not adopt an existing long, and it does not cancel or replace another bot's orders or stop plans.
 
-Every exit is a reduce-only close of at most the smaller of this bot's base and the current exchange long. If the exchange long is smaller than the share, the order is capped at the long and the cap is logged. The bot's exchange stop is its own partial plan (`volType` 1), sized to its own base at its own stop price. A partial exit cancels and replaces that plan. A full exit cancels only that plan.
+Every exit is a reduce-only close of this bot's own base, and only when that base is not larger than the exchange long. If the exchange long is smaller than the share, the bot halts. It does not close the residual, because that residual may belong to the other bot. A market sell is not sent for a hard stop while this bot's exchange stop is still open, and any other exit cancels that stop before the sell is sent. The exchange stop is its own partial plan (`volType` 1), sized to its own base at its own stop price. It is left in place while the size and price are unchanged. A partial exit cancels and replaces that plan. A full exit cancels only that plan.
 
 MEXC does allow several partial stop plans on one long. Two limits still apply. The new volume plus the volume of stop plans already on the position must be less than the closable quantity, so two plans that add up to the whole long can be rejected. A new plan at the same price does not create a second order: the exchange returns the existing id and updates that plan. This controller will not adopt or cancel that id, and it keeps new entries off until it has a stop of its own.
 
@@ -156,7 +156,7 @@ MEXC does allow several partial stop plans on one long. Two limits still apply. 
 | `aiot_fin_b_shared` | `fin_b` | 2200 USDT | The same fin_b rules as the paper bot, on this bot's share only |
 | `aiot_f3l20_shared` | `f3l20` | 1650 USDT per leg | F3 entry, one add at RSI14 <= 20, up to 3300 USDT |
 
-F3-L20 buys one `total_amount_quote` on a 15m close with RSI14 <= 28 and EMA50 > EMA200. While that leg is open, one later 15m close with RSI14 <= 20 buys the same amount again and does not re-check the trend. The bot sells its whole share at the next open after RSI14 >= 70, at a stop 10 percent under the average fill (the exchange stop is replaced after the second leg), or 24 hours after the first fill.
+F3-L20 buys one `total_amount_quote` on a 15m close with RSI14 <= 28 and EMA50 > EMA200. While that leg is open, one later 15m close with RSI14 <= 20 buys the same amount again and does not re-check the trend. The engine sells the whole share at the next open after RSI14 >= 70, at a stop 10 percent under the average fill (the exchange stop is replaced after the second leg), or 24 hours after the first fill. The live bot sends that market order when the 15m bar closes, the same as the paper bot.
 
 The two configs together can hold 5500 USDT (2200 plus two legs of 1650). Deploy them like the paper bots, with connector `mexc_perpetual`, leverage 1, position mode HEDGE, and one config per bot.
 
