@@ -5,8 +5,8 @@ connector_name: mexc_perpetual
 trading_pair: AIOT-USDT
 candles_connector: mexc
 candles_trading_pair: AIOT-USDT
-# One leg. A second leg can add the same amount, so the bot can hold 3300.
-total_amount_quote: 1650
+# One leg. A second leg can add the same amount, so the bot can hold 3100.
+total_amount_quote: 1550
 leverage: 1
 position_mode: HEDGE
 size_mode: max
