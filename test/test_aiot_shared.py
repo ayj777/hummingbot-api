@@ -16,6 +16,7 @@ from bots.controllers.directional_trading.aiot_shared import (
     AiotSharedConfig,
     AiotSharedController,
     parse_fill_row,
+    parse_stop_fill,
     reconcile_share,
 )
 from bots.scripts.v2_with_controllers import V2WithControllers
@@ -1120,11 +1121,14 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
     bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
     bot._sleeves[0].stop_price = 0.07
     bot._apply_live_position()
-    await asyncio.sleep(0)
+    for _ in range(4):
+        await asyncio.sleep(0)
     assert bot._share_halt
     assert bot._sleeves[0].base == 100.0
-    assert [call for call in book.calls if call[0] == "place"] == []
-    assert ("cancel", ["stop-a"]) in book.calls
+    places = [call for call in book.calls if call[0] == "place"]
+    assert places
+    assert places[-1][3] == Decimal("80.00000000")
+    assert bot._stop["amount"] == "80.00000000"
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1150,71 @@ async def test_a_cancel_is_saved_before_the_sell(tmp_path):
     assert keep is False
     assert sold[0].executor_config.amount == Decimal("100.00000000")
     assert sold[0].executor_config.position_action is PositionAction.CLOSE
+
+
+def test_states_4_and_5_are_not_stop_fills():
+    failed = {"id": "stop-a", "state": 5, "realityVol": "10", "isFinished": 1, "stopLossPrice": "0.07"}
+    invalid = {"id": "stop-a", "state": 4, "realityVol": "10", "isFinished": 1, "stopLossPrice": "0.07"}
+    assert parse_stop_fill(failed, Decimal("10")) is None
+    assert parse_stop_fill(invalid, Decimal("10")) is None
+    executed = parse_stop_fill(
+        {"id": "stop-a", "state": 3, "realityVol": "10", "stopLossPrice": "0.07"},
+        Decimal("10"),
+    )
+    assert executed[0] == "stop-a"
+    assert executed[1] == Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_plan_does_not_stop_the_other_bots_long(tmp_path):
+    book = _Book([])
+    book.account_positions = {"k": _long(80)}
+
+    async def list_stop_orders(_pair):
+        return [{"id": "stop-a", "state": 2, "triggerSide": 0, "realityVol": "0", "vol": "10", "stopLossPrice": "0.07"}]
+
+    book.list_stop_orders = list_stop_orders
+    bot = _bot(connector=book)
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    (tmp_path / "aiot_shared_bot-b.json").write_text(
+        json.dumps({"sleeves": [{"name": "core", "base": 80}]}),
+        encoding="utf-8",
+    )
+    _armed(bot, 100, "stop-a", 0.07)
+    bot._apply_live_position()
+    bot._schedule_stops()
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert bot._share_halt
+    assert bot._sleeves[0].base == 100.0
+    assert [call for call in book.calls if call[0] == "place"] == []
+
+
+@pytest.mark.asyncio
+async def test_finished_stop_list_uses_the_plan_time_and_pages_past_100():
+    calls = []
+
+    class Connector:
+        def exchange_symbol_associated_to_pair(self, _pair):
+            return "AIOT_USDT"
+
+        async def _api_get(self, path_url, params, is_auth_required):
+            calls.append(dict(params))
+            assert path_url == "/api/v1/private/stoporder/list/orders"
+            assert is_auth_required is True
+            if params["page_num"] == 1:
+                return {"data": [{"id": "old-%s" % i, "state": 2} for i in range(100)]}
+            return {"data": [{"id": "stop-a", "state": 3, "realityVol": "1", "stopLossPrice": "0.07"}]}
+
+    bot = _bot(connector=Connector())
+    bot._stop = {"id": "stop-a", "amount": "10", "price": "0.07", "created": 100000}
+    rows = await bot._stop_plan_rows(Connector())
+    assert [row["id"] for row in rows if row["id"] == "stop-a"] == ["stop-a"]
+    assert len(calls) == 2
+    assert calls[0]["start_time"] == 100000
+    assert calls[0]["page_num"] == 1
+    assert calls[1]["page_num"] == 2
+    assert calls[0]["is_finished"] == 1
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():

@@ -76,20 +76,11 @@ def parse_fill_row(row, contract_size=Decimal("1")):
 
 
 def _stop_fill_executed(row) -> bool:
+    """Only MEXC state 3 is an executed fill. 4 and 5 are not."""
     state = row.get("state", row.get("status"))
-    if state in (2, "2", "cancelled", "canceled"):
-        return False
-    if state in (1, "1", "untriggered"):
-        # triggerSide 2 is a stop-loss trigger. realityVol is the contracts filled.
-        triggered = row.get("triggerSide") in (2, "2")
-        filled = row.get("realityVol") not in (None, "", 0, "0", "0.0")
-        return triggered and filled
-    if state in (3, "3", "executed", "filled", "finished"):
+    if state in (3, "3"):
         return True
-    finished = row.get("isFinished", row.get("is_finished"))
-    if finished in (1, "1", True) and state not in (1, "1"):
-        return True
-    if state is not None or finished is not None:
+    if state not in (None, ""):
         return False
     for key in ("base", "dealVol", "realityVol"):
         if row.get(key) not in (None, ""):
@@ -950,7 +941,59 @@ class AiotSharedController(research.AiotResearchController):
         self.logger().error(reason)
         if getattr(self, "_loading_state", False):
             return
+        self._protect_remainder()
         self._save_state()
+
+    def _other_base(self) -> Decimal:
+        """Base still booked by the other shared bots, from their state files."""
+        total = Decimal("0")
+        folder = self._state_path.parent
+        if not folder.is_dir():
+            return total
+        for path in folder.glob("aiot_shared_*.json"):
+            try:
+                if path.resolve() == self._state_path.resolve():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for item in (payload.get("sleeves") if isinstance(payload, dict) else None) or []:
+                if isinstance(item, dict):
+                    total += _decimal_or_none(item.get("base")) or Decimal("0")
+        return total
+
+    def _protect_cap(self) -> Decimal:
+        """Stop size that cannot cover the other bot's book. 0 means place nothing."""
+        live = self._live_long if self._live_long is not None else Decimal("0")
+        room = live - self._other_base()
+        if room < 0:
+            room = Decimal("0")
+        return min(self._own_base(), room)
+
+    def _protect_remainder(self) -> None:
+        if self._stop_inflight or getattr(self, "_protecting", False):
+            return
+        cap = self._protect_cap()
+        if cap <= 0:
+            return
+        state = self._stop or {}
+        if state.get("id") and shares_match(state.get("amount") or 0, cap):
+            return
+        connector = self._connector()
+        if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
+            return
+        price = self._hard_stop_price() or state.get("price")
+        if not price:
+            return
+        self._protecting = True
+        self._stop_inflight = True
+        safe_ensure_future(self._finish_protect(connector, cap, price))
+
+    async def _finish_protect(self, connector, cap, price) -> None:
+        try:
+            await self._run_stop(connector, "place", cap, price)
+        finally:
+            self._protecting = False
 
     def _read_finished_plan(self) -> None:
         """Read this plan's executed size before any halt can cover the residual."""
@@ -970,11 +1013,6 @@ class AiotSharedController(research.AiotResearchController):
             plans = await self._stop_plan_rows(connector)
             if self._book_exchange_stop_fill(str(current), plans):
                 return
-            rows = await self._open_stop_rows(connector)
-            ids = research.stop_order_ids(rows) if rows is not None else None
-            if ids and str(current) in [str(item) for item in ids]:
-                self._stop_cancel_requested = True
-                await self._run_stop(connector, "cancel", 0, None)
             if self._own_base() > 0 and self._own_exceeds_long():
                 self._halt(self._residual_reason())
         finally:
@@ -1241,18 +1279,38 @@ class AiotSharedController(research.AiotResearchController):
             pair = symbol(self.config.trading_pair)
             if hasattr(pair, "__await__"):
                 pair = await pair
-            response = await api(
-                path_url="/api/v1/private/stoporder/list/orders",
-                params={"symbol": pair, "is_finished": 1, "page_num": 1, "page_size": 100},
-                is_auth_required=True,
-            )
+            return await self._page_stop_plans(api, pair)
         except Exception as exc:
             self.logger().warning(f"AIOT shared could not list stop plans: {exc}")
             return []
-        data = response.get("data") if isinstance(response, dict) else response
-        if isinstance(data, dict):
-            data = data.get("resultList") or data.get("orders") or data.get("list")
-        return data if isinstance(data, list) else []
+
+    async def _page_stop_plans(self, api, pair):
+        """Page the finished list from this plan's create time until its id shows up."""
+        want = str((self._stop or {}).get("id") or "")
+        start = (self._stop or {}).get("created")
+        found = []
+        page = 1
+        while page <= 20:
+            params = {"symbol": pair, "is_finished": 1, "page_num": page, "page_size": 100}
+            if start not in (None, ""):
+                params["start_time"] = int(start)
+            response = await api(
+                path_url="/api/v1/private/stoporder/list/orders",
+                params=params,
+                is_auth_required=True,
+            )
+            data = response.get("data") if isinstance(response, dict) else response
+            if isinstance(data, dict):
+                data = data.get("resultList") or data.get("orders") or data.get("list")
+            if not isinstance(data, list) or not data:
+                break
+            found.extend(data)
+            if want and any(isinstance(row, dict) and _stop_row_id(row) == want for row in data):
+                break
+            if len(data) < 100:
+                break
+            page += 1
+        return found
 
     def _book_exchange_stop_fill(self, plan_id, rows) -> bool:
         """Book this plan's executed contracts. Other plans in the list are ignored."""
@@ -1314,6 +1372,7 @@ class AiotSharedController(research.AiotResearchController):
             "id": str(new_id),
             "amount": str(research._decimal(base)),
             "price": str(placed),
+            "created": int(self._now() * 1000),
         }
         key = f"stop:{new_id}"
         current = self._own_orders.get(key)
