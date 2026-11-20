@@ -1125,10 +1125,9 @@ async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
         await asyncio.sleep(0)
     assert bot._share_halt
     assert bot._sleeves[0].base == 100.0
-    places = [call for call in book.calls if call[0] == "place"]
-    assert places
-    assert places[-1][3] == Decimal("80.00000000")
-    assert bot._stop["amount"] == "80.00000000"
+    assert [call for call in book.calls if call[0] == "place"] == []
+    assert ("cancel", ["stop-a"]) in book.calls
+    assert bot._stop == {}
 
 
 @pytest.mark.asyncio
@@ -1188,6 +1187,8 @@ async def test_a_cancelled_plan_does_not_stop_the_other_bots_long(tmp_path):
     assert bot._share_halt
     assert bot._sleeves[0].base == 100.0
     assert [call for call in book.calls if call[0] == "place"] == []
+    assert ("cancel", ["stop-a"]) in book.calls
+    assert bot._stop == {}
 
 
 @pytest.mark.asyncio
@@ -1215,6 +1216,54 @@ async def test_finished_stop_list_uses_the_plan_time_and_pages_past_100():
     assert calls[0]["page_num"] == 1
     assert calls[1]["page_num"] == 2
     assert calls[0]["is_finished"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sibling", ["absent", "zero", "broken", "eighty", "high"])
+async def test_a_smaller_long_does_not_get_a_stop_from_the_other_file(tmp_path, sibling):
+    book = _Book([{"id": "stop-a", "stopLossPrice": "0.07", "base": "100"}])
+    book.account_positions = {"k": _long(80)}
+    book.fill_history = lambda: [{"client_order_id": "cid-stop-a", "base": "100"}]
+
+    async def list_stop_orders(_pair):
+        return [{"id": "stop-a", "state": 2, "realityVol": "0", "vol": "10", "stopLossPrice": "0.07"}]
+
+    book.list_stop_orders = list_stop_orders
+    bot = _bot(connector=book)
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    other = tmp_path / "aiot_shared_bot-b.json"
+    if sibling == "zero":
+        other.write_text(json.dumps({"sleeves": [{"base": 0}]}), encoding="utf-8")
+    elif sibling == "broken":
+        other.write_text('{"sleeves": [{"base": 80', encoding="utf-8")
+    elif sibling == "eighty":
+        other.write_text(json.dumps({"sleeves": [{"base": 80}]}), encoding="utf-8")
+    elif sibling == "high":
+        other.write_text(json.dumps({"sleeves": [{"base": 200}]}), encoding="utf-8")
+    _armed(bot, 100, "stop-a", 0.07)
+    bot._apply_live_position()
+    bot._schedule_stops()
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert bot._share_halt
+    assert bot._sleeves[0].base == 100.0
+    assert [call for call in book.calls if call[0] == "place"] == []
+    assert ("cancel", ["stop-a"]) in book.calls
+    assert bot._stop == {}
+
+
+def test_an_old_stop_query_stays_inside_ninety_days():
+    bot = _bot()
+    bot._now = lambda: 200 * 24 * 60 * 60
+    bot._stop = {"id": "stop-a", "created": 1000}
+    windows = bot._stop_windows()
+    span = 89 * 24 * 60 * 60 * 1000
+    assert len(windows) == 2
+    assert windows[0][0] > 1000
+    assert windows[1][0] == 1000
+    for start, end in windows:
+        assert end >= start
+        assert end - start <= span
 
 
 def test_a_missing_client_id_does_not_guess_a_fill():

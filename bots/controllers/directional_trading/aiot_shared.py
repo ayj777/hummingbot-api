@@ -941,59 +941,13 @@ class AiotSharedController(research.AiotResearchController):
         self.logger().error(reason)
         if getattr(self, "_loading_state", False):
             return
-        self._protect_remainder()
+        # The other bot's book is in its own instance directory. A missing,
+        # stale, or unreadable file is not an empty book, so a halt never
+        # places a stop on the long that is left. Cancel this plan when it
+        # is larger than that long.
+        if self._own_exceeds_long():
+            self._request_stop_cancel()
         self._save_state()
-
-    def _other_base(self) -> Decimal:
-        """Base still booked by the other shared bots, from their state files."""
-        total = Decimal("0")
-        folder = self._state_path.parent
-        if not folder.is_dir():
-            return total
-        for path in folder.glob("aiot_shared_*.json"):
-            try:
-                if path.resolve() == self._state_path.resolve():
-                    continue
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            for item in (payload.get("sleeves") if isinstance(payload, dict) else None) or []:
-                if isinstance(item, dict):
-                    total += _decimal_or_none(item.get("base")) or Decimal("0")
-        return total
-
-    def _protect_cap(self) -> Decimal:
-        """Stop size that cannot cover the other bot's book. 0 means place nothing."""
-        live = self._live_long if self._live_long is not None else Decimal("0")
-        room = live - self._other_base()
-        if room < 0:
-            room = Decimal("0")
-        return min(self._own_base(), room)
-
-    def _protect_remainder(self) -> None:
-        if self._stop_inflight or getattr(self, "_protecting", False):
-            return
-        cap = self._protect_cap()
-        if cap <= 0:
-            return
-        state = self._stop or {}
-        if state.get("id") and shares_match(state.get("amount") or 0, cap):
-            return
-        connector = self._connector()
-        if connector is None or not callable(getattr(connector, "place_position_stop_order", None)):
-            return
-        price = self._hard_stop_price() or state.get("price")
-        if not price:
-            return
-        self._protecting = True
-        self._stop_inflight = True
-        safe_ensure_future(self._finish_protect(connector, cap, price))
-
-    async def _finish_protect(self, connector, cap, price) -> None:
-        try:
-            await self._run_stop(connector, "place", cap, price)
-        finally:
-            self._protecting = False
 
     def _read_finished_plan(self) -> None:
         """Read this plan's executed size before any halt can cover the residual."""
@@ -1284,32 +1238,51 @@ class AiotSharedController(research.AiotResearchController):
             self.logger().warning(f"AIOT shared could not list stop plans: {exc}")
             return []
 
+    def _stop_windows(self):
+        """Finished-list windows. A start and end cannot span more than 90 days."""
+        start = (self._stop or {}).get("created")
+        if start in (None, ""):
+            return [(None, None)]
+        span = 89 * 24 * 60 * 60 * 1000
+        now_ms = int(self._now() * 1000)
+        start_ms = int(start)
+        if now_ms < start_ms:
+            now_ms = start_ms
+        recent = start_ms if now_ms - start_ms <= span else now_ms - span
+        windows = [(recent, now_ms)]
+        if start_ms < recent:
+            windows.append((start_ms, min(now_ms, start_ms + span)))
+        return windows
+
     async def _page_stop_plans(self, api, pair):
         """Page the finished list from this plan's create time until its id shows up."""
         want = str((self._stop or {}).get("id") or "")
-        start = (self._stop or {}).get("created")
         found = []
-        page = 1
-        while page <= 20:
-            params = {"symbol": pair, "is_finished": 1, "page_num": page, "page_size": 100}
-            if start not in (None, ""):
-                params["start_time"] = int(start)
-            response = await api(
-                path_url="/api/v1/private/stoporder/list/orders",
-                params=params,
-                is_auth_required=True,
-            )
-            data = response.get("data") if isinstance(response, dict) else response
-            if isinstance(data, dict):
-                data = data.get("resultList") or data.get("orders") or data.get("list")
-            if not isinstance(data, list) or not data:
-                break
-            found.extend(data)
-            if want and any(isinstance(row, dict) and _stop_row_id(row) == want for row in data):
-                break
-            if len(data) < 100:
-                break
-            page += 1
+        pages = 0
+        for start_ms, end_ms in self._stop_windows():
+            page = 1
+            while page <= 20 and pages < 20:
+                params = {"symbol": pair, "is_finished": 1, "page_num": page, "page_size": 100}
+                if start_ms is not None:
+                    params["start_time"] = int(start_ms)
+                    params["end_time"] = int(end_ms)
+                response = await api(
+                    path_url="/api/v1/private/stoporder/list/orders",
+                    params=params,
+                    is_auth_required=True,
+                )
+                pages += 1
+                data = response.get("data") if isinstance(response, dict) else response
+                if isinstance(data, dict):
+                    data = data.get("resultList") or data.get("orders") or data.get("list")
+                if not isinstance(data, list) or not data:
+                    break
+                found.extend(data)
+                if want and any(isinstance(row, dict) and _stop_row_id(row) == want for row in data):
+                    return found
+                if len(data) < 100:
+                    break
+                page += 1
         return found
 
     def _book_exchange_stop_fill(self, plan_id, rows) -> bool:
