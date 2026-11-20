@@ -873,6 +873,140 @@ def test_a_stop_whose_volume_changed_is_not_left_in_place():
     assert places[0][3] == Decimal("100.00000000")
 
 
+@pytest.mark.asyncio
+async def test_a_stop_rounded_down_to_the_tick_is_not_replaced():
+    tick = Decimal("0.0001")
+    book = _Book([{"id": "stop-a", "stopLossPrice": "0.07000000"}])
+    book.trading_rules = {
+        "AIOT-USDT": SimpleNamespace(
+            min_order_size=Decimal("10"),
+            max_order_size=MAX_BASE,
+            min_base_amount_increment=Decimal("10"),
+            min_price_increment=tick,
+        )
+    }
+    bot = _bot(connector=book)
+    sleeve = bot._sleeves[0]
+    sleeve.base = 100.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07003
+    bot._live_long = Decimal("180")
+    bot._positions_seen = True
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    for _ in range(3):
+        bot._stop_inflight = False
+        bot._stop_sync_inflight = False
+        bot._stop_sync_next = 0.0
+        bot._schedule_stops()
+        await asyncio.sleep(0)
+    assert [call for call in book.calls if call[0] in ("cancel", "place")] == []
+    assert bot._stop["id"] == "stop-a"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_plan_key_is_not_looked_up_as_a_client_order(tmp_path):
+    seen = []
+
+    class Connector:
+        async def _request_order_by_client_id(self, pair, client_id):
+            seen.append(str(client_id))
+            if str(client_id).startswith("stop:"):
+                raise ValueError(f"Order {client_id} not found")
+            return {"externalOid": client_id, "dealVol": "10", "dealAvgPrice": "0.1"}
+
+        def get_contract_size(self, _pair):
+            return Decimal("10")
+
+    bot = _bot(connector=Connector())
+    bot._state_path = tmp_path / "aiot_shared_bot-a.json"
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._own_orders = {
+        "cid-a": {"side": "buy", "base": "100.00000000", "price": "0.1", "level": "shared:core:buy"},
+        "stop:77": {
+            "side": "sell",
+            "level": "shared:stop:sell",
+            "plan_id": "77",
+            "base": "0.00000000",
+            "price": "0.07",
+        },
+    }
+    bot._stop = {"id": "77", "amount": "100.00000000", "price": "0.07000000"}
+    bot._share_checked = False
+    assert bot.confirm_share() is False
+    await asyncio.sleep(0)
+    assert seen == ["cid-a"]
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == pytest.approx(100.0)
+
+
+def test_history_and_the_executor_do_not_double_the_share():
+    bot = _bot(connector=SimpleNamespace(fill_history=lambda: [{"client_order_id": "cid-a", "base": "40"}]))
+    bot._own_orders = {"cid-a": {"side": "buy", "base": "0.00000000", "price": "0", "level": "shared:core:buy"}}
+    bot._sleeves[0].base = 0.0
+    bot._share_checked = False
+    bot._live_long = Decimal("40")
+    bot.executors_info = [_executor("e1", "shared:core:buy", 40, 0.1, "cid-a")]
+    bot._reconcile()
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == pytest.approx(40.0)
+    assert bot._own_orders["cid-a"]["base"] == "40.00000000"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_plan_is_booked_as_this_bots_sell_when_the_long_shrinks():
+    book = _Book([])
+    bot = _bot(connector=book)
+    sleeve = bot._sleeves[0]
+    sleeve.base = 100.0
+    sleeve.phase = "open"
+    sleeve.stop_price = 0.07
+    bot._live_long = Decimal("80")
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    await bot._sync_stops(book)
+    assert bot._share_halt is None
+    assert bot._stop["id"] == "stop-a"
+    await bot._sync_stops(book)
+    assert bot._share_halt is None
+    assert bot._sleeves[0].base == 0.0
+    assert bot._sleeves[0].phase == "flat"
+    assert bot._own_orders["stop:stop-a"]["base"] == "100.00000000"
+    assert bot._stop == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cancel_does_not_ignore_a_missing_plan():
+    book = _Book([])
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("timeout")
+
+    book.cancel_stop_orders = boom
+    bot = _bot(connector=book)
+    bot._stop_cancel_requested = True
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._live_long = Decimal("80")
+    bot._stop = {"id": "s1", "amount": "100.00000000", "price": "0.07000000"}
+    await bot._run_stop(book, "cancel", 0, None)
+    assert bot._stop_cancel_requested is False
+    assert bot._stop.get("id") == "s1"
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_stop_is_cancelled_when_the_long_is_smaller():
+    book = _Book([{"id": "stop-a"}])
+    book.account_positions = {"k": _long(80)}
+    bot = _bot(connector=book)
+    bot._sleeves[0].base = 100.0
+    bot._sleeves[0].phase = "open"
+    bot._stop = {"id": "stop-a", "amount": "100.00000000", "price": "0.07000000"}
+    bot._apply_live_position()
+    await asyncio.sleep(0)
+    assert bot._share_halt
+    assert ("cancel", ["stop-a"]) in book.calls
+
+
 def test_a_missing_client_id_does_not_guess_a_fill():
     bot = _bot()
     bot.executors_info = [

@@ -171,6 +171,11 @@ def reconcile_share(orders, rows, contract_size=Decimal("1")):
             if plan not in plans:
                 if shares_match(slot.get("base") or 0, 0):
                     continue
+                # A client-order read has no plan fills. Keep a sell this bot already booked.
+                if not plans:
+                    seen = _decimal_or_none(slot.get("base")) or Decimal("0")
+                    net -= seen
+                    continue
                 return (
                     "halt",
                     None,
@@ -338,6 +343,27 @@ def _stop_rows(rows):
     if not isinstance(rows, list):
         return None
     return rows
+
+
+def _is_plan_slot(client_id, slot) -> bool:
+    if slot.get("plan_id"):
+        return True
+    return str(client_id).startswith("stop:")
+
+
+def _booked_overlap(orders, rows) -> Decimal:
+    """How much of these executor rows is already stored on their client ids."""
+    total = Decimal("0")
+    for client_id, base, _price in rows or []:
+        if base <= 0:
+            continue
+        slot = orders.get(client_id)
+        if slot is None:
+            continue
+        have = _decimal_or_none(slot.get("base")) or Decimal("0")
+        if have > 0:
+            total += min(have, base)
+    return total
 
 
 def _executor_owner(executor) -> str:
@@ -649,7 +675,9 @@ class AiotSharedController(research.AiotResearchController):
             if callable(getter):
                 size = Decimal(str(getter(self.config.trading_pair)))
             rows = []
-            for client_id in list(self._own_orders):
+            for client_id, slot in list(self._own_orders.items()):
+                if _is_plan_slot(client_id, slot):
+                    continue
                 data = await connector._request_order_by_client_id(self.config.trading_pair, client_id)
                 if not isinstance(data, dict):
                     raise ValueError(f"order {client_id} was not a record")
@@ -699,7 +727,12 @@ class AiotSharedController(research.AiotResearchController):
             if not rows:
                 self._halt("AIOT shared filled an order it cannot tie to one client order id. " "Entries and exits are halted.")
                 return False
-            delta = filled - recorded
+            # History may already have put this fill on the sleeve. Add only the new part.
+            already = _booked_overlap(self._own_orders, rows)
+            delta = filled - max(float(recorded), float(already))
+            if delta <= float(_SHARE_TOLERANCE):
+                self._applied_base[executor.id] = filled
+                return True
             self._applied_base[executor.id] = filled
             now = int(self._now())
             if role == "buy":
@@ -911,6 +944,8 @@ class AiotSharedController(research.AiotResearchController):
             own = self._own_base()
             if own > mapped and not self._history_inflight:
                 self._halt(self._residual_reason())
+                # A plan larger than the long can still close the other bot's residual.
+                self._request_stop_cancel()
             elif own > 0 and not self._share_halt:
                 self._upgrade_fallback_stop()
             return
@@ -1038,7 +1073,12 @@ class AiotSharedController(research.AiotResearchController):
         if self._stop_missing < 2:
             return
         self.logger().error(f"AIOT shared stop {current} is no longer open. Another bot's plan was not adopted.")
-        # Keep the plan id. A later history read can still attribute its fill.
+        tracked = _decimal_or_none((self._stop or {}).get("amount")) or Decimal("0")
+        own = self._own_base()
+        live = self._live_long
+        if tracked > 0 and own > 0 and live is not None and live < own:
+            self._book_local_stop_fill(str(current), min(tracked, own))
+            return
         if self._own_base() > 0:
             self._halt(
                 f"AIOT shared stop {current} is gone and its fill could not be attributed. " "Entries and exits are halted."
@@ -1118,7 +1158,10 @@ class AiotSharedController(research.AiotResearchController):
         tick = self._price_tick()
         if tick is None:
             return False
-        return wanted < tracked <= wanted + tick * 8
+        floored = (wanted // tick) * tick
+        if tracked == floored:
+            return True
+        return floored < tracked <= floored + tick * 8
 
     def _history_rows(self, connector):
         history = getattr(connector, "fill_history", None)
@@ -1133,6 +1176,34 @@ class AiotSharedController(research.AiotResearchController):
             rows.close()
             return None
         return list(rows or [])
+
+    def _book_local_stop_fill(self, plan: str, base: Decimal) -> None:
+        price = _decimal_or_none((self._stop or {}).get("price")) or Decimal("0")
+        self._own_orders[f"stop:{plan}"] = {
+            "side": "sell",
+            "level": "shared:stop:sell",
+            "plan_id": plan,
+            "base": _amount_text(base),
+            "price": _amount_text(price),
+        }
+        self._stop = {}
+        self._stop_missing = 0
+        self._stop_cancel_requested = False
+        left = base
+        for sleeve in self._sleeves:
+            if left <= 0 or sleeve.base <= 0:
+                continue
+            sell = min(float(left), sleeve.base)
+            sleeve.exit_reason = "stop"
+            if sell >= sleeve.base - 1e-12:
+                sleeve.apply_sell_fill(float(price), int(self._now()), -1)
+            else:
+                sleeve.apply_partial_sell(float(price), sell, int(self._now()), -1)
+            left -= Decimal(str(sell))
+        self.logger().warning(
+            "AIOT shared exchange stop is gone. This bot booked that plan as its own sell " "and did not send another close."
+        )
+        self._save_state()
 
     def _drop_unfilled_stop(self, stop_id) -> None:
         if not stop_id:
@@ -1245,6 +1316,8 @@ class AiotSharedController(research.AiotResearchController):
                 return
             self._remember_stop(new_id, base, price)
         except Exception as exc:
+            if not cancelled:
+                self._stop_cancel_requested = False
             kept = bool(state.get("id")) and not cancelled
             if kept:
                 self._stop = state
