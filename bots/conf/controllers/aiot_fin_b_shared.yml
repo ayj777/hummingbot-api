@@ -5,7 +5,7 @@ connector_name: mexc_perpetual
 trading_pair: AIOT-USDT
 candles_connector: mexc
 candles_trading_pair: AIOT-USDT
-total_amount_quote: 2200
+total_amount_quote: 2000
 leverage: 1
 position_mode: HEDGE
 size_mode: max
