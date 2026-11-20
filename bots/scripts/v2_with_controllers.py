@@ -23,6 +23,10 @@ def drawdown_quote_from_equity(balance):
     return equity * Decimal("0.20")
 
 
+def _aiot_controller(name) -> bool:
+    return name in ("aiot_research", "aiot_shared")
+
+
 def _quote_balance(connector, trading_pair: str):
     getter = getattr(connector, "get_available_balance", None)
     if not callable(getter):
@@ -186,7 +190,7 @@ class V2WithControllers(StrategyV2Base):
         for controller_id, controller in self.controllers.items():
             self.max_pnl_by_controller[controller_id] = Decimal("0")
             config_dict = controller.config.model_dump()
-            if config_dict.get("controller_name") == "aiot_research":
+            if _aiot_controller(config_dict.get("controller_name")):
                 aiot = True
             name = config_dict.get("connector_name")
             if name is None or not self.is_perpetual(name):
@@ -206,7 +210,7 @@ class V2WithControllers(StrategyV2Base):
         connector = self.connectors[connector_name]
         pair = config_dict["trading_pair"]
         leverage = int(config_dict["leverage"])
-        if config_dict.get("controller_name") != "aiot_research":
+        if not _aiot_controller(config_dict.get("controller_name")):
             connector.set_leverage(leverage=leverage, trading_pair=pair)
             return
         confirm = getattr(connector, "confirm_leverage_and_margin", None)
@@ -230,7 +234,7 @@ class V2WithControllers(StrategyV2Base):
         found = False
         for controller in self.controllers.values():
             dumped = controller.config.model_dump()
-            if dumped.get("controller_name") != "aiot_research":
+            if not _aiot_controller(dumped.get("controller_name")):
                 continue
             found = True
             connector = self.connectors.get(dumped.get("connector_name"))
@@ -250,7 +254,7 @@ class V2WithControllers(StrategyV2Base):
                 )
             for controller in self.controllers.values():
                 dumped = controller.config.model_dump()
-                if dumped.get("controller_name") != "aiot_research":
+                if not _aiot_controller(dumped.get("controller_name")):
                     continue
                 refuse = getattr(controller, "refuse_entries", None)
                 if callable(refuse):

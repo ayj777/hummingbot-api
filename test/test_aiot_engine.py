@@ -17,6 +17,7 @@ from bots.controllers.directional_trading.aiot_engine import (
     SleeveSpec,
     build_contexts,
     ema_adjust_false,
+    f3_l20_strategy,
     population_zscore,
     simulate_contexts,
     true_ranges,
@@ -357,6 +358,74 @@ def test_f3_wiring_enters_from_real_rsi_on_a_synthetic_uptrend_then_dump():
     assert contexts[signal].ema50 > contexts[signal].ema200
     assert buys[0].notional == pytest.approx(15000.0)
     assert buys[0].price == pytest.approx(bars[buys[0].bar_index].open)
+
+
+def test_f3_l20_adds_one_leg_at_20_without_rechecking_the_trend():
+    rows = _flat(100, 6)
+    contexts = [
+        Context(rsi=28.0, ema50=2.0, ema200=1.0),
+        Context(rsi=20.0, ema50=1.0, ema200=2.0),
+        Context(rsi=10.0, ema50=1.0, ema200=2.0),
+        Context(rsi=70.0, ema50=2.0, ema200=1.0),
+        Context(rsi=40.0, ema50=2.0, ema200=1.0),
+        Context(rsi=40.0, ema50=2.0, ema200=1.0),
+    ]
+    result = _run(f3_l20_strategy(), rows, contexts)
+    buys = _buys(result)
+    assert [fill.reason for fill in buys] == ["entry", "add"]
+    assert [fill.notional for fill in buys] == pytest.approx([1500.0, 1500.0])
+    assert buys[0].price == pytest.approx(100.0)
+    assert buys[1].price == pytest.approx(100.0)
+    sell = _sells(result)[0]
+    assert sell.reason == "rsi"
+    assert sell.base == pytest.approx(buys[0].base + buys[1].base)
+    assert len(buys) == 2
+
+
+def test_f3_l20_does_not_enter_without_the_trend_or_above_28():
+    rows = _flat(100, 3)
+    no_trend = _run(f3_l20_strategy(), rows, [Context(rsi=20.0, ema50=1.0, ema200=2.0)] * 3)
+    too_high = _run(f3_l20_strategy(), rows, [Context(rsi=28.01, ema50=2.0, ema200=1.0)] * 3)
+    assert _buys(no_trend) == []
+    assert _buys(too_high) == []
+
+
+def test_f3_l20_stop_is_10_percent_under_the_average_fill():
+    rows = [
+        (100, 100, 100, 100),
+        (100, 100, 100, 100),
+        (140, 140, 140, 140),
+        (110, 110, 95, 100),
+        (100, 100, 100, 100),
+    ]
+    contexts = [
+        Context(rsi=28.0, ema50=2.0, ema200=1.0),
+        Context(rsi=20.0, ema50=1.0, ema200=2.0),
+        Context(rsi=40.0, ema50=2.0, ema200=1.0),
+        Context(rsi=40.0, ema50=2.0, ema200=1.0),
+        Context(rsi=40.0, ema50=2.0, ema200=1.0),
+    ]
+    result = _run(f3_l20_strategy(), rows, contexts)
+    buys = _buys(result)
+    assert len(buys) == 2
+    assert buys[1].price == pytest.approx(140.0)
+    sell = _sells(result)[0]
+    assert sell.reason == "stop"
+    assert sell.price == pytest.approx(108.0)
+    assert result.sleeves[0].phase == "flat"
+
+
+def test_f3_l20_time_stop_is_24h_after_the_first_fill():
+    rows = _flat(100, 110)
+    contexts = [Context(rsi=28.0, ema50=2.0, ema200=1.0), Context(rsi=20.0, ema50=1.0, ema200=2.0)]
+    contexts += [Context(rsi=40.0, ema50=2.0, ema200=1.0)] * 108
+    result = _run(f3_l20_strategy(), rows, contexts)
+    buys = _buys(result)
+    sell = _sells(result)[0]
+    assert len(buys) == 2
+    assert sell.reason == "time"
+    assert sell.time - buys[0].time == 24 * 60 * 60
+    assert sell.time - buys[1].time == 24 * 60 * 60 - 900
 
 
 # --- ladder -----------------------------------------------------------------

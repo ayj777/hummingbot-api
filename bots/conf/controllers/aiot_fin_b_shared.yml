@@ -1,0 +1,16 @@
+id: aiot_fin_b_shared
+controller_name: aiot_shared
+controller_type: directional_trading
+connector_name: mexc_perpetual
+trading_pair: AIOT-USDT
+candles_connector: mexc
+candles_trading_pair: AIOT-USDT
+total_amount_quote: 2200
+leverage: 1
+position_mode: HEDGE
+size_mode: max
+strategy: fin_b
+stop_loss:
+take_profit:
+time_limit:
+trailing_stop:
