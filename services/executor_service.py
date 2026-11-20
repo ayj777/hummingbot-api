@@ -3574,8 +3574,13 @@ class ExecutorService:
         # The whole dict is passed to the config model. Range iceberg fields
         # (protective_exchange_stop, stop_loss_fallback_seconds,
         # allow_adverse_take_profit, protective_stop_buffer_pct,
-        # exchange_stop_trigger_price) reach the executor once that model
-        # declares them. This method does not keep a field whitelist.
+        # exchange_stop_trigger_price, schedule_interval, slice_amount)
+        # reach the executor once that model declares them. This method does
+        # not keep a field whitelist. A blank duration is no time limit.
+        if executor_type == "range_iceberg_executor":
+            duration = executor_config.get("duration")
+            if duration is None or (isinstance(duration, str) and not duration.strip()):
+                executor_config["duration"] = None
         executor_class, config_class = self.EXECUTOR_REGISTRY[executor_type]
         try:
             typed_config = config_class(**executor_config)

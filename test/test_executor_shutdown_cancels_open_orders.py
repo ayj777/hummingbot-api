@@ -1256,6 +1256,36 @@ def test_validate_forwards_protective_stop_fields():
     assert typed.connector_name == "mexc_perpetual"
 
 
+def test_blank_duration_keeps_schedule_interval_and_slice_amount():
+    service = _service()
+    base = {
+        "type": "range_iceberg_executor",
+        "connector_name": "mexc_perpetual",
+        "trading_pair": "AIOT-USDT",
+        "side": "BUY",
+        "total_amount": "1000",
+        "price_low": "0.08",
+        "price_high": "0.09",
+        "schedule_interval": "1h",
+        "slice_amount": "100",
+        "timestamp": 10,
+    }
+    payloads = [
+        dict(base),
+        dict(base, duration=None),
+        dict(base, duration=""),
+        dict(base, duration="  "),
+    ]
+    for payload in payloads:
+        _executor_class, _config_class, typed = service._validate_executor_config(payload)
+        assert typed.duration is None
+        assert typed.schedule_interval == "1h"
+        assert typed.slice_amount == Decimal("100")
+        count, interval = typed.resolved_schedule()
+        assert count == 10
+        assert interval == 3600.0
+
+
 def _long_position(amount):
     return {
         "BTC-USDT:LONG": SimpleNamespace(
